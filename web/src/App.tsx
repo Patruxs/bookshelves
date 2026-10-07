@@ -6,7 +6,6 @@ import { useCallback } from "react";
 import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 import { RouterLink } from "./components/RouterLink";
 import { Shell, type ColorMode } from "./components/Shell";
-import { useMediaQuery } from "./lib/hooks";
 import { LibraryProvider } from "./lib/library";
 import { STORAGE_KEYS, useStoredState } from "./lib/storage";
 import { BookDetailPage } from "./pages/BookDetail";
@@ -15,9 +14,8 @@ import { HomePage } from "./pages/Home";
 import { NotFoundPage } from "./pages/NotFound";
 
 export function App() {
-  const prefersDark = useMediaQuery("(prefers-color-scheme: dark)");
   const [storedMode, setStoredMode] = useStoredState<ColorMode | null>(STORAGE_KEYS.theme, null);
-  const mode: ColorMode = storedMode ?? (prefersDark ? "dark" : "light");
+  const mode: ColorMode = storedMode ?? "light";
   const toggleMode = useCallback(() => setStoredMode(mode === "dark" ? "light" : "dark"), [mode, setStoredMode]);
 
   return (

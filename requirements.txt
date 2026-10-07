@@ -7,10 +7,16 @@
 # ══════════════════════════════════════════════════════════
 
 # Cover extraction from PDF & EPUB
-PyMuPDF>=1.23.0
+PyMuPDF>=1.24,<2
 
 # Image processing & WebP conversion
-Pillow>=10.0.0
+Pillow>=10,<13
 
 # Cover extraction from DOCX files
-python-docx>=1.0.0
+python-docx>=1.1,<2
+
+# Terminal UI rendering (panels, tables, colors)
+rich>=13,<16
+
+# Full-screen terminal UI (scripts/bookshelves_tui)
+textual>=3,<8

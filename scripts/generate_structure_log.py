@@ -1,161 +1,131 @@
 #!/usr/bin/env python3
-"""
-📚 Generate Library Structure Log — AI-Optimized Format
-
-Scan data.json (source of truth) to create library_structure.log
-as plain text that is easy for the AI Agent to read before classifying books.
-
-Output format:
-- List all categories, topics, and subtopics
-- Count books in each folder
-- List specific book filenames to help the AI avoid duplicates
-
-Usage:
-    python scripts/generate_structure_log.py --base-dir .
-"""
+from __future__ import annotations
 
 import argparse
-import json
-import re
 import sys
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 
+from lib.book_paths import expected_display_from_file_path, parse_category_name
+from lib.cli_common import EXIT_FAILURE, EXIT_OK, add_base_dir_arg, add_json_arg, json_mode, run_main
+from lib.constants import CATEGORY_PATTERN, DATA_JSON
+from lib.json_io import load_books
 from lib.output import emit_json
 
+LOG_FILENAME = 'library_structure.log'
+CATEGORY_ROOT = '__root__'
+UNNUMBERED_CATEGORY_ORDER = 999
 
-CATEGORY_PATTERN = re.compile(r'^(\d+)_(.+)$')
+
+@dataclass(frozen=True)
+class ParsedBookPath:
+    category: str
+    topic: str
+    subtopic: str
+    filename: str
 
 
-def parse_file_path(file_path: str) -> dict:
-    """Parse a book's file_path into category, topic, subtopic, filename.
-
-    Args:
-        file_path: e.g. 'Books/2_Software_Engineering_Disciplines/DevOps/file.pdf'
-
-    Returns:
-        Dict with keys: category, topic, subtopic (optional), filename
-    """
-    parts = Path(file_path).parts
-    # Expected: ('Books', 'N_Category', 'Topic', [Subtopic,] 'file.ext')
-    if len(parts) < 4:
+def parse_file_path(file_path: str) -> ParsedBookPath | None:
+    category_display, _topic_display = expected_display_from_file_path(file_path)
+    if category_display is None:
         return None
 
-    result = {
-        'category': parts[1],
-        'topic': parts[2],
-        'subtopic': None,
-        'filename': parts[-1],
-    }
-    if len(parts) == 5:
-        result['subtopic'] = parts[3]
-        # filename is already parts[-1]
-    elif len(parts) > 5:
-        # Deep nesting — join middle parts as subtopic
-        result['subtopic'] = '/'.join(parts[3:-1])
-
-    return result
+    parts = Path(file_path).parts
+    folder_parts = parts[2:-1]
+    return ParsedBookPath(
+        category=parts[1],
+        topic=folder_parts[0] if folder_parts else CATEGORY_ROOT,
+        subtopic='/'.join(folder_parts[1:]) or CATEGORY_ROOT,
+        filename=parts[-1],
+    )
 
 
-def generate_log(base_dir: str) -> str:
-    """Generate the library structure log from data.json.
+def load_library_books(base_dir: Path) -> list[dict]:
+    if not (base_dir / DATA_JSON).is_file():
+        raise FileNotFoundError(f"{DATA_JSON} not found in {base_dir}")
+    return load_books(base_dir)
 
-    Args:
-        base_dir: Root directory of the project.
 
-    Returns:
-        Formatted string for library_structure.log
-    """
-    data_path = Path(base_dir) / 'site' / 'data.json'
-    if not data_path.exists():
-        return "ERROR: site/data.json not found."
+def write_log(content: str, output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, 'w', encoding='utf-8', newline='\n') as f:
+        f.write(content)
 
-    with open(data_path, 'r', encoding='utf-8') as f:
-        books = json.load(f)
 
-    # Build tree structure:
-    # categories -> topics -> subtopics -> [filenames]
-    tree = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
-    category_order = {}  # category_folder -> number prefix for sorting
+def write_log_if_changed(content: str, output_path: Path) -> bool:
+    try:
+        if output_path.read_text(encoding='utf-8') == content:
+            return False
+    except (OSError, UnicodeDecodeError):
+        pass
+    write_log(content, output_path)
+    return True
+
+
+def generate_log(base_dir: Path) -> Path:
+    output_path = base_dir / LOG_FILENAME
+    write_log(render_log(load_library_books(base_dir)), output_path)
+    return output_path
+
+
+def category_number(category_folder: str) -> int:
+    match = CATEGORY_PATTERN.match(category_folder)
+    return int(match.group(1)) if match else UNNUMBERED_CATEGORY_ORDER
+
+
+def file_bullets(prefix: str, filenames: list[str]) -> list[str]:
+    return [f"{prefix}• {filename}" for filename in sorted(filenames)]
+
+
+def render_log(books: list[dict]) -> str:
+    tree: dict[str, dict[str, dict[str, list[str]]]] = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
 
     for book in books:
-        fp = book.get('file_path', '')
-        parsed = parse_file_path(fp)
-        if not parsed:
+        if not isinstance(book, dict):
             continue
+        parsed = parse_file_path(str(book.get('file_path') or ''))
+        if parsed:
+            tree[parsed.category][parsed.topic][parsed.subtopic].append(parsed.filename)
 
-        cat = parsed['category']
-        topic = parsed['topic']
-        subtopic = parsed['subtopic'] or '__root__'
-        filename = parsed['filename']
+    sorted_cats = sorted(tree, key=lambda cat: (category_number(cat), cat))
 
-        tree[cat][topic][subtopic].append(filename)
-
-        # Extract sort order from category prefix
-        match = CATEGORY_PATTERN.match(cat)
-        if match:
-            category_order[cat] = int(match.group(1))
-
-    # Sort categories by numeric prefix
-    sorted_cats = sorted(tree.keys(), key=lambda c: category_order.get(c, 999))
-
-    # Build output
-    lines = []
-    lines.append("=" * 60)
-    lines.append("LIBRARY STRUCTURE LOG")
-    lines.append(f"Generated from: site/data.json ({len(books)} books total)")
-    lines.append("=" * 60)
-    lines.append("")
+    lines = [
+        "=" * 60,
+        "LIBRARY STRUCTURE LOG",
+        f"Generated from: {DATA_JSON} ({len(books)} books total)",
+        "=" * 60,
+        "",
+    ]
 
     for cat in sorted_cats:
         match = CATEGORY_PATTERN.match(cat)
-        if match:
-            cat_readable = match.group(2).replace('_', ' ')
-            cat_num = match.group(1)
-        else:
-            cat_readable = cat
-            cat_num = '?'
-
-        # Count total books in category
-        cat_book_count = sum(
-            len(files)
-            for topics in tree[cat].values()
-            for files in topics.values()
-        )
+        cat_num = match.group(1) if match else '?'
+        cat_book_count = sum(len(files) for topics in tree[cat].values() for files in topics.values())
 
         lines.append(f"[{cat_num}] {cat} ({cat_book_count} books)")
-        lines.append(f"    Display Name: {cat_readable}")
+        lines.append(f"    Display Name: {parse_category_name(cat)}")
 
-        sorted_topics = sorted(tree[cat].keys())
+        category_root_files = tree[cat].get(CATEGORY_ROOT, {}).get(CATEGORY_ROOT, [])
+        lines.extend(file_bullets("    ", category_root_files))
+
+        sorted_topics = sorted(topic for topic in tree[cat] if topic != CATEGORY_ROOT)
         for t_idx, topic in enumerate(sorted_topics):
-            is_last_topic = (t_idx == len(sorted_topics) - 1)
+            is_last_topic = t_idx == len(sorted_topics) - 1
             branch = "└──" if is_last_topic else "├──"
-
-            # Count books in this topic (including subtopics)
-            topic_book_count = sum(len(files) for files in tree[cat][topic].values())
+            subtopics = tree[cat][topic]
+            topic_book_count = sum(len(files) for files in subtopics.values())
 
             lines.append(f"    {branch} {topic} ({topic_book_count} books)")
 
-            subtopics = tree[cat][topic]
-            # Check if there are real subtopics (not just __root__)
-            real_subtopics = [s for s in subtopics if s != '__root__']
-            root_files = subtopics.get('__root__', [])
+            prefix = "        " if is_last_topic else "    │   "
+            lines.extend(file_bullets(f"{prefix}    ", subtopics.get(CATEGORY_ROOT, [])))
 
-            # List root-level files in this topic
-            prefix = "    │   " if not is_last_topic else "        "
-            if root_files:
-                for f_idx, fname in enumerate(sorted(root_files)):
-                    lines.append(f"{prefix}    • {fname}")
-
-            # List subtopics
-            for s_idx, sub in enumerate(sorted(real_subtopics)):
-                is_last_sub = (s_idx == len(real_subtopics) - 1)
-                sub_branch = "└──" if is_last_sub else "├──"
-                sub_files = subtopics[sub]
-
-                lines.append(f"{prefix}{sub_branch} {sub} ({len(sub_files)} books)")
-                for fname in sorted(sub_files):
-                    lines.append(f"{prefix}        • {fname}")
+            real_subtopics = sorted(sub for sub in subtopics if sub != CATEGORY_ROOT)
+            for s_idx, sub in enumerate(real_subtopics):
+                sub_branch = "└──" if s_idx == len(real_subtopics) - 1 else "├──"
+                lines.append(f"{prefix}{sub_branch} {sub} ({len(subtopics[sub])} books)")
+                lines.extend(file_bullets(f"{prefix}        ", subtopics[sub]))
 
         lines.append("")
 
@@ -163,58 +133,60 @@ def generate_log(base_dir: str) -> str:
     lines.append("AVAILABLE CATEGORIES (for classification):")
     lines.append("")
     for cat in sorted_cats:
-        match = CATEGORY_PATTERN.match(cat)
-        if match:
-            lines.append(f"  {cat}")
-            # List all topics
-            for topic in sorted(tree[cat].keys()):
-                subtopics = [s for s in tree[cat][topic] if s != '__root__']
-                if subtopics:
-                    for sub in sorted(subtopics):
-                        lines.append(f"    -> {topic}/{sub}")
-                else:
-                    lines.append(f"    -> {topic}")
+        if not CATEGORY_PATTERN.match(cat):
+            continue
+        lines.append(f"  {cat}")
+        for topic in sorted(topic for topic in tree[cat] if topic != CATEGORY_ROOT):
+            subtopic_names = sorted(sub for sub in tree[cat][topic] if sub != CATEGORY_ROOT)
+            if subtopic_names:
+                lines.extend(f"    -> {topic}/{sub}" for sub in subtopic_names)
+            else:
+                lines.append(f"    -> {topic}")
     lines.append("")
-    next_num = max(category_order.values(), default=0) + 1
-    lines.append(f"Next available category number: {next_num}")
+    numbered = [category_number(cat) for cat in sorted_cats if CATEGORY_PATTERN.match(cat)]
+    lines.append(f"Next available category number: {max(numbered, default=0) + 1}")
     lines.append("=" * 60)
 
     return '\n'.join(lines)
 
 
-def main():
-    """Entry point for generate_structure_log.py."""
-    parser = argparse.ArgumentParser(
-        description='Generate library_structure.log from data.json'
-    )
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description='Generate library_structure.log from data.json')
+    add_base_dir_arg(parser)
+    add_json_arg(parser)
     parser.add_argument(
-        '--base-dir', default='.',
-        help='Base directory of the library (default: current directory)'
+        '--output', default=LOG_FILENAME,
+        help=f'Output file path relative to --base-dir (default: {LOG_FILENAME})',
     )
-    parser.add_argument(
-        '--output', default=None,
-        help='Output file path (default: library_structure.log in base-dir)'
-    )
-    parser.add_argument('--json', action='store_true', help='Emit a machine-readable JSON summary')
-    args = parser.parse_args()
+    return parser
 
-    log_content = generate_log(args.base_dir)
 
-    output_path = args.output or str(Path(args.base_dir) / 'library_structure.log')
-    with open(output_path, 'w', encoding='utf-8') as f:
-        f.write(log_content)
+def write_structure_log(base_dir: Path, output_path: Path) -> tuple[int, dict]:
+    try:
+        books = load_library_books(base_dir)
+        log_content = render_log(books)
+        write_log(log_content, output_path)
+    except (OSError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return EXIT_FAILURE, {"ok": False, "error": str(exc)}
+    print(f"Generated {output_path} ({len(books)} books)")
+    return EXIT_OK, {
+        "ok": True,
+        "output": output_path,
+        "books": len(books),
+        "bytes": len(log_content.encode("utf-8")),
+    }
 
-    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    base_dir = args.base_dir.resolve()
+    with json_mode(args.json):
+        exit_code, summary = write_structure_log(base_dir, base_dir / args.output)
     if args.json:
-        emit_json({
-            "ok": not log_content.startswith("ERROR:"),
-            "output": output_path,
-            "bytes": len(log_content.encode("utf-8")),
-        })
-    else:
-        print(f"Generated: {output_path}")
-        print(log_content)
+        emit_json(summary)
+    return exit_code
 
 
 if __name__ == '__main__':
-    main()
+    run_main(main)

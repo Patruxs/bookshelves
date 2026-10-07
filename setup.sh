@@ -1,21 +1,16 @@
 #!/usr/bin/env bash
-# ══════════════════════════════════════════════════════════
-# 📚 My Bookshelves — One-Command Setup (macOS / Linux / Git Bash)
-# ══════════════════════════════════════════════════════════
-# Usage: chmod +x setup.sh && ./setup.sh
-# ══════════════════════════════════════════════════════════
 
 set -e
 cd "$(dirname "$0")"
+ROOT_DIR="$(pwd)"
 export PYTHONUTF8=1
 export PYTHONIOENCODING=utf-8
 
-# Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 BOLD='\033[1m'
 
 echo ""
@@ -24,28 +19,39 @@ echo -e "${CYAN}║${NC}  📚 ${BOLD}My Bookshelves — Setup${NC}             
 echo -e "${CYAN}╚══════════════════════════════════════════════════════╝${NC}"
 echo ""
 
-# ── Step 1: Check Python ──
 echo -e "[1/5] 🐍 Checking Python..."
 
-# Try python3 first, then python
 PYTHON_CMD=""
 if command -v python3 &>/dev/null; then
     PYTHON_CMD="python3"
 elif command -v python &>/dev/null; then
     PYTHON_CMD="python"
 else
-    echo -e "   ${RED}❌ Python not found! Please install Python 3.8+${NC}"
+    echo -e "   ${RED}❌ Python not found! Please install Python 3.10+${NC}"
     echo "      https://www.python.org/downloads/"
     exit 1
 fi
 
 PYTHON_VERSION=$($PYTHON_CMD --version 2>&1 | awk '{print $2}')
+if ! "$PYTHON_CMD" -c "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)"; then
+    echo -e "   ${RED}❌ $PYTHON_CMD $PYTHON_VERSION is too old. Please install Python 3.10+${NC}"
+    echo "      https://www.python.org/downloads/"
+    exit 1
+fi
 echo -e "   ${GREEN}✅ $PYTHON_CMD $PYTHON_VERSION detected${NC}"
+
+is_windows_shell() {
+    [ "${OS:-}" = "Windows_NT" ] || uname -s 2>/dev/null | grep -Eq '^(MINGW|MSYS|CYGWIN)'
+}
 
 find_venv_python() {
     if [ -x "venv/bin/python" ]; then
         echo "venv/bin/python"
         return 0
+    fi
+
+    if ! is_windows_shell; then
+        return 1
     fi
 
     if [ -x "venv/Scripts/python.exe" ]; then
@@ -96,12 +102,15 @@ create_venv() {
     fi
 }
 
-# ── Step 2: Create virtual environment + upgrade/install dependencies ──
 echo ""
 echo -e "[2/5] 📥 Creating virtual environment and upgrading Python dependencies..."
 
 SYSTEM_PYTHON_CMD="$PYTHON_CMD"
 if ! VENV_PYTHON="$(find_venv_python)"; then
+    if [ -d "venv" ] && ! is_windows_shell; then
+        echo -e "   ${YELLOW}⚠️  venv/ was built for another OS (no venv/bin/python). Recreating venv...${NC}"
+        rm -rf venv
+    fi
     create_venv "$SYSTEM_PYTHON_CMD"
 fi
 PYTHON_CMD="$VENV_PYTHON"
@@ -116,20 +125,33 @@ if venv_has_broken_pip; then
 fi
 
 echo "   Installing or upgrading requirements..."
-if ! "$PYTHON_CMD" -X utf8 -m pip install --upgrade --upgrade-strategy eager --disable-pip-version-check --no-cache-dir -r requirements.txt; then
+if ! "$PYTHON_CMD" -X utf8 -m pip install --upgrade --upgrade-strategy eager --disable-pip-version-check --no-cache-dir -r requirements-dev.txt; then
     echo -e "   ${RED}❌ Failed to install or upgrade dependencies${NC}"
     exit 1
 fi
 echo -e "   ${GREEN}✅ All dependencies installed or upgraded${NC}"
 
-# ── Step 3: Create project directories ──
+BOOKSHELVES_LINK="$HOME/.local/bin/bookshelves"
+if ! is_windows_shell; then
+    if [ -e "$BOOKSHELVES_LINK" ] && [ ! -L "$BOOKSHELVES_LINK" ]; then
+        echo -e "   ${YELLOW}⚠️  $BOOKSHELVES_LINK exists and is not a symlink; left untouched${NC}"
+    elif mkdir -p "$HOME/.local/bin" && ln -sf "$ROOT_DIR/bookshelves" "$BOOKSHELVES_LINK"; then
+        echo -e "   ${GREEN}✅ Linked $BOOKSHELVES_LINK → $ROOT_DIR/bookshelves${NC}"
+        case ":$PATH:" in
+            *":$HOME/.local/bin:"*) ;;
+            *) echo -e "   ${YELLOW}⚠️  Add ~/.local/bin to PATH to run 'bookshelves' from anywhere${NC}" ;;
+        esac
+    else
+        echo -e "   ${YELLOW}⚠️  Could not link $BOOKSHELVES_LINK; run ./bookshelves from the repo instead${NC}"
+    fi
+fi
+
 echo ""
 echo -e "[3/5] 📁 Creating project directories..."
 
-mkdir -p Books Inbox site/assets/covers
-echo -e "   ${GREEN}✅ Books/  Inbox/  site/assets/covers/${NC}"
+mkdir -p Books Inbox data assets/covers
+echo -e "   ${GREEN}✅ Books/  Inbox/  assets/covers/${NC}"
 
-# ── Step 4: Verify installation ──
 echo ""
 echo -e "[4/5] ✅ Verifying setup..."
 
@@ -151,34 +173,34 @@ else
     echo -e "   ${RED}❌ python-docx not working${NC}"
 fi
 
-# ── Step 5: Optional reset + doctor ──
 echo ""
 echo -e "[5/5] 🩺 Running repo doctor..."
 if [ "${1:-}" = "--reset-sample-data" ]; then
     echo -e "   ${YELLOW}⚠️  Resetting sample data because --reset-sample-data was provided${NC}"
-    "$PYTHON_CMD" scripts/reset_library.py --force
+    "$PYTHON_CMD" scripts/reset_library.py --execute --yes
 else
     echo -e "   ${GREEN}✅ Skipping reset. Existing library data is preserved.${NC}"
 fi
-"$PYTHON_CMD" scripts/cli.py doctor --base-dir .
+if ! "$PYTHON_CMD" scripts/cli.py doctor --base-dir .; then
+    echo -e "   ${YELLOW}⚠️  Doctor reported problems (see above). Setup itself finished.${NC}"
+fi
 
-# ── Done ──
 echo ""
 echo -e "${CYAN}╔══════════════════════════════════════════════════════╗${NC}"
 echo -e "${CYAN}║${NC}  🎉 ${BOLD}Setup complete!${NC}                                ${CYAN}║${NC}"
 echo -e "${CYAN}╠══════════════════════════════════════════════════════╣${NC}"
 echo -e "${CYAN}║${NC}                                                     ${CYAN}║${NC}"
 echo -e "${CYAN}║${NC}  View locally:                                      ${CYAN}║${NC}"
-echo -e "${CYAN}║${NC}    python -m http.server 8080                       ${CYAN}║${NC}"
-echo -e "${CYAN}║${NC}    → http://localhost:8080/site/                     ${CYAN}║${NC}"
+echo -e "${CYAN}║${NC}    cd web && npm run dev                            ${CYAN}║${NC}"
+echo -e "${CYAN}║${NC}    → http://localhost:5173/bookshelves/           ${CYAN}║${NC}"
 echo -e "${CYAN}║${NC}                                                     ${CYAN}║${NC}"
 echo -e "${CYAN}║${NC}  Add books:                                         ${CYAN}║${NC}"
 echo -e "${CYAN}║${NC}    1. Drop files into Inbox/                        ${CYAN}║${NC}"
-echo -e "${CYAN}║${NC}    2. ./book generate --base-dir .                  ${CYAN}║${NC}"
+echo -e "${CYAN}║${NC}    2. Run bookshelves, pick Auto-Organize           ${CYAN}║${NC}"
 echo -e "${CYAN}║${NC}                                                     ${CYAN}║${NC}"
 echo -e "${CYAN}║${NC}  Shortcuts:                                         ${CYAN}║${NC}"
-echo -e "${CYAN}║${NC}    ./book tui                                       ${CYAN}║${NC}"
-echo -e "${CYAN}║${NC}    ./book doctor                                    ${CYAN}║${NC}"
+echo -e "${CYAN}║${NC}    bookshelves          (TUI)                       ${CYAN}║${NC}"
+echo -e "${CYAN}║${NC}    bookshelves doctor                               ${CYAN}║${NC}"
 echo -e "${CYAN}║${NC}                                                     ${CYAN}║${NC}"
 echo -e "${CYAN}╚══════════════════════════════════════════════════════╝${NC}"
 echo ""

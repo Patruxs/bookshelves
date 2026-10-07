@@ -1,51 +1,67 @@
 #!/usr/bin/env python3
-"""Convert PDF files in Inbox to image-based EPUB files."""
-
 from __future__ import annotations
 
 import argparse
 import html
 import os
-import sys
 import uuid
 import zipfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
-from lib.output import ProgressCallback, emit_json, make_progress_printer
+from lib.cli_common import EXIT_FAILURE, run_main
+from lib.covers import import_pymupdf
+from lib.inbox_jobs import (
+    ConversionPlan,
+    InboxJob,
+    add_inbox_args,
+    build_plan,
+    confirm_execution,
+    finish,
+    plan_to_results,
+    report_error,
+    resolve_inbox_dir,
+    run_plan,
+)
+from lib.output import ProgressCallback, make_progress_printer
 
-if sys.stdout.encoding != "utf-8":
-    sys.stdout.reconfigure(encoding="utf-8")
-if sys.stderr.encoding != "utf-8":
-    sys.stderr.reconfigure(encoding="utf-8")
+PDF_TO_EPUB = InboxJob(
+    title="My Bookshelves PDF to EPUB Converter",
+    source_suffix=".pdf",
+    target_suffix=".epub",
+    action="Convert PDF to image-based EPUB",
+    execute_hint="Add --execute to create EPUBs.",
+)
+
+JPEG_QUALITY = 85
+DEFAULT_LANGUAGE = "en"
 
 
-@dataclass
-class ConversionPlan:
-    """Planned PDF to EPUB conversion."""
-
-    source: Path
-    target: Path
-    status: str
-    message: str
+@dataclass(frozen=True)
+class ImageFormat:
+    pixmap_output: str
+    extension: str
+    media_type: str
 
 
-@dataclass
-class ConversionResult:
-    """Result for one PDF to EPUB conversion."""
+IMAGE_FORMATS = {
+    "jpeg": ImageFormat("jpeg", ".jpg", "image/jpeg"),
+    "png": ImageFormat("png", ".png", "image/png"),
+}
 
-    source: str
-    target: str
-    status: str
-    message: str
+CONTAINER_XML = """<?xml version="1.0" encoding="utf-8"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles>
+    <rootfile full-path="OEBPS/package.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>
+"""
 
 
 @dataclass
 class RenderedPage:
-    """One rendered PDF page for EPUB packaging."""
-
     index: int
     image_name: str
     width: int
@@ -53,77 +69,25 @@ class RenderedPage:
     image_bytes: bytes
 
 
+@dataclass(frozen=True)
+class PageEntry:
+    index: int
+    image_name: str
+    width: int
+    height: int
+
+
 def import_fitz():
-    """Import PyMuPDF with a clear error if it is missing."""
-    try:
-        import fitz  # type: ignore[import-not-found]
-    except ImportError as exc:
+    fitz = import_pymupdf()
+    if fitz is None:
         raise RuntimeError(
             "PyMuPDF is required. Install dependencies with: "
             "python -m pip install -r requirements.txt"
-        ) from exc
+        )
     return fitz
 
 
-def relative_path(path: Path, base_dir: Path) -> str:
-    """Return a readable path, relative to base_dir when possible."""
-    try:
-        return path.relative_to(base_dir).as_posix()
-    except ValueError:
-        return path.as_posix()
-
-
-def resolve_inbox_dir(base_dir: Path, inbox_arg: str) -> Path:
-    """Resolve and validate an Inbox directory under the project root."""
-    inbox_dir = Path(inbox_arg)
-    if not inbox_dir.is_absolute():
-        inbox_dir = base_dir / inbox_dir
-
-    inbox_dir = inbox_dir.resolve()
-    try:
-        inbox_dir.relative_to(base_dir)
-    except ValueError as exc:
-        raise ValueError(f"--inbox-dir must be inside --base-dir: {inbox_dir}") from exc
-
-    if not inbox_dir.exists():
-        raise FileNotFoundError(f"Inbox directory not found: {inbox_dir}")
-    if not inbox_dir.is_dir():
-        raise NotADirectoryError(f"Inbox path is not a directory: {inbox_dir}")
-    return inbox_dir
-
-
-def iter_pdfs(inbox_dir: Path) -> list[Path]:
-    """Return PDF files directly under Inbox."""
-    return sorted(path for path in inbox_dir.iterdir() if path.suffix.lower() == ".pdf")
-
-
-def build_plan(inbox_dir: Path, *, overwrite: bool) -> list[ConversionPlan]:
-    """Build a conversion plan for PDF files in Inbox."""
-    plans: list[ConversionPlan] = []
-    for source in iter_pdfs(inbox_dir):
-        target = source.with_suffix(".epub")
-        if target.exists() and not overwrite:
-            plans.append(
-                ConversionPlan(
-                    source=source,
-                    target=target,
-                    status="skipped",
-                    message="EPUB already exists; use --overwrite to replace it",
-                )
-            )
-            continue
-
-        status = "planned"
-        message = "Convert PDF to image-based EPUB"
-        if target.exists() and overwrite:
-            message = "Convert PDF to EPUB and overwrite existing EPUB"
-        plans.append(ConversionPlan(source=source, target=target, status=status, message=message))
-
-    return plans
-
-
 def should_report_page(current: int, total: int) -> bool:
-    """Return True when page progress should be emitted (about 10 updates per book)."""
     if total <= 0:
         return False
     if current == 1 or current == total:
@@ -136,13 +100,11 @@ def render_pdf_pages(
     source: Path,
     *,
     zoom: float,
+    image_format: ImageFormat = IMAGE_FORMATS["jpeg"],
     on_page: Callable[[int, int], None] | None = None,
-) -> list[RenderedPage]:
-    """Render PDF pages to PNG images for EPUB packaging."""
+) -> Iterator[RenderedPage]:
     fitz = import_fitz()
     doc = fitz.open(source)
-    pages: list[RenderedPage] = []
-
     try:
         if doc.needs_pass:
             raise RuntimeError("PDF is password-protected; unlock it before converting")
@@ -153,30 +115,26 @@ def render_pdf_pages(
         matrix = fitz.Matrix(zoom, zoom)
         for index, page in enumerate(doc, 1):
             pix = page.get_pixmap(matrix=matrix, alpha=False)
-            pages.append(
-                RenderedPage(
-                    index=index,
-                    image_name=f"page_{index:04d}.png",
-                    width=pix.width,
-                    height=pix.height,
-                    image_bytes=pix.tobytes("png"),
-                )
+            yield RenderedPage(
+                index=index,
+                image_name=f"page_{index:04d}{image_format.extension}",
+                width=pix.width,
+                height=pix.height,
+                image_bytes=pix.tobytes(image_format.pixmap_output, jpg_quality=JPEG_QUALITY),
             )
             if on_page is not None:
                 on_page(index, total_pages)
     finally:
         doc.close()
 
-    return pages
 
-
-def page_xhtml(page: RenderedPage, title: str) -> str:
-    """Build one XHTML page containing a rendered PDF page image."""
+def page_xhtml(page: PageEntry, title: str, language: str) -> str:
     escaped_title = html.escape(title)
     alt = html.escape(f"{title} page {page.index}")
+    lang = html.escape(language)
     return f"""<?xml version="1.0" encoding="utf-8"?>
 <!DOCTYPE html>
-<html xmlns="http://www.w3.org/1999/xhtml" lang="en">
+<html xmlns="http://www.w3.org/1999/xhtml" lang="{lang}" xml:lang="{lang}">
 <head>
   <title>{escaped_title} - Page {page.index}</title>
   <link rel="stylesheet" type="text/css" href="../styles/style.css"/>
@@ -194,12 +152,13 @@ def package_opf(
     title: str,
     identifier: str,
     modified: str,
-    pages: list[RenderedPage],
+    language: str,
+    pages: list[PageEntry],
+    image_format: ImageFormat,
 ) -> str:
-    """Build EPUB package metadata."""
     escaped_title = html.escape(title)
     image_items = "\n".join(
-        f'    <item id="img-{page.index}" href="images/{page.image_name}" media-type="image/png"/>'
+        f'    <item id="img-{page.index}" href="images/{page.image_name}" media-type="{image_format.media_type}"/>'
         for page in pages
     )
     page_items = "\n".join(
@@ -213,7 +172,7 @@ def package_opf(
   <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
     <dc:identifier id="book-id">{identifier}</dc:identifier>
     <dc:title>{escaped_title}</dc:title>
-    <dc:language>en</dc:language>
+    <dc:language>{html.escape(language)}</dc:language>
     <meta property="dcterms:modified">{modified}</meta>
   </metadata>
   <manifest>
@@ -229,16 +188,16 @@ def package_opf(
 """
 
 
-def nav_xhtml(title: str, pages: list[RenderedPage]) -> str:
-    """Build EPUB navigation document."""
+def nav_xhtml(title: str, language: str, pages: list[PageEntry]) -> str:
     escaped_title = html.escape(title)
+    lang = html.escape(language)
     links = "\n".join(
         f'      <li><a href="pages/page_{page.index:04d}.xhtml">Page {page.index}</a></li>'
         for page in pages
     )
     return f"""<?xml version="1.0" encoding="utf-8"?>
 <!DOCTYPE html>
-<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" lang="en">
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" lang="{lang}" xml:lang="{lang}">
 <head>
   <title>{escaped_title}</title>
 </head>
@@ -255,7 +214,6 @@ def nav_xhtml(title: str, pages: list[RenderedPage]) -> str:
 
 
 def stylesheet() -> str:
-    """Build compact CSS for page-image EPUB output."""
     return """html, body {
   margin: 0;
   padding: 0;
@@ -277,29 +235,32 @@ img {
 """
 
 
-def write_epub(target: Path, title: str, pages: list[RenderedPage]) -> None:
-    """Write an EPUB 3 archive."""
+def write_epub(
+    target: Path,
+    title: str,
+    rendered_pages: Iterator[RenderedPage],
+    *,
+    language: str,
+    image_format: ImageFormat,
+) -> None:
     identifier = f"urn:uuid:{uuid.uuid4()}"
-    modified = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    with zipfile.ZipFile(target, "w") as epub:
+    modified = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    pages: list[PageEntry] = []
+    with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as epub:
         epub.writestr("mimetype", "application/epub+zip", compress_type=zipfile.ZIP_STORED)
-        epub.writestr(
-            "META-INF/container.xml",
-            """<?xml version="1.0" encoding="utf-8"?>
-<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
-  <rootfiles>
-    <rootfile full-path="OEBPS/package.opf" media-type="application/oebps-package+xml"/>
-  </rootfiles>
-</container>
-""",
-            compress_type=zipfile.ZIP_DEFLATED,
-        )
-        epub.writestr("OEBPS/package.opf", package_opf(title, identifier, modified, pages))
-        epub.writestr("OEBPS/nav.xhtml", nav_xhtml(title, pages))
+        epub.writestr("META-INF/container.xml", CONTAINER_XML)
         epub.writestr("OEBPS/styles/style.css", stylesheet())
-        for page in pages:
-            epub.writestr(f"OEBPS/pages/page_{page.index:04d}.xhtml", page_xhtml(page, title))
-            epub.writestr(f"OEBPS/images/{page.image_name}", page.image_bytes)
+        for rendered in rendered_pages:
+            page = PageEntry(rendered.index, rendered.image_name, rendered.width, rendered.height)
+            epub.writestr(
+                f"OEBPS/images/{page.image_name}",
+                rendered.image_bytes,
+                compress_type=zipfile.ZIP_STORED,
+            )
+            epub.writestr(f"OEBPS/pages/page_{page.index:04d}.xhtml", page_xhtml(page, title, language))
+            pages.append(page)
+        epub.writestr("OEBPS/package.opf", package_opf(title, identifier, modified, language, pages, image_format))
+        epub.writestr("OEBPS/nav.xhtml", nav_xhtml(title, language, pages))
 
 
 def convert_pdf_to_epub(
@@ -308,188 +269,99 @@ def convert_pdf_to_epub(
     *,
     overwrite: bool,
     zoom: float,
+    image_format: str = "jpeg",
+    language: str = DEFAULT_LANGUAGE,
     on_page: Callable[[int, int], None] | None = None,
 ) -> tuple[str, str]:
-    """Convert a single PDF to an image-based EPUB file."""
     if target.exists() and not overwrite:
         return "skipped", "EPUB already exists; use --overwrite to replace it"
     if zoom <= 0:
         return "failed", "--zoom must be greater than 0"
 
     temp_path = target.with_name(f".{target.stem}.converting{target.suffix}")
-    if temp_path.exists():
-        temp_path.unlink()
-
     try:
-        pages = render_pdf_pages(source, zoom=zoom, on_page=on_page)
-        write_epub(temp_path, source.stem, pages)
+        temp_path.unlink(missing_ok=True)
+        selected_format = IMAGE_FORMATS[image_format]
+        pages = render_pdf_pages(source, zoom=zoom, image_format=selected_format, on_page=on_page)
+        write_epub(temp_path, source.stem, pages, language=language, image_format=selected_format)
         os.replace(temp_path, target)
     except Exception as exc:
-        if temp_path.exists():
-            temp_path.unlink()
         return "failed", f"Conversion failed: {exc}"
+    finally:
+        temp_path.unlink(missing_ok=True)
 
     return "converted", "PDF converted to image-based EPUB"
 
 
-def execute_plan(
-    plans: list[ConversionPlan],
-    base_dir: Path,
-    *,
-    overwrite: bool,
-    zoom: float,
-    fail_fast: bool = False,
-    progress: ProgressCallback | None = None,
-) -> list[ConversionResult]:
-    """Execute planned conversions and return results."""
-    report = progress or (lambda _message: None)
-    total = len(plans)
-    if total:
-        report(f"Converting {total} book(s)...")
+def page_progress(progress: ProgressCallback | None) -> Callable[[int, int], None] | None:
+    if progress is None:
+        return None
 
-    results: list[ConversionResult] = []
-    for index, plan in enumerate(plans, 1):
-        prefix = f"[{index}/{total}]"
-        source_name = plan.source.name
-        target_name = plan.target.name
+    def on_page(current: int, total_pages: int) -> None:
+        if should_report_page(current, total_pages):
+            progress(f"  page {current}/{total_pages}")
 
-        if plan.status == "skipped":
-            report(f"{prefix} skip {source_name} - {plan.message}")
-            results.append(
-                ConversionResult(
-                    source=relative_path(plan.source, base_dir),
-                    target=relative_path(plan.target, base_dir),
-                    status=plan.status,
-                    message=plan.message,
-                )
-            )
-            continue
-
-        report(f"{prefix} converting {source_name} -> {target_name}")
-
-        def on_page(current: int, total_pages: int) -> None:
-            if should_report_page(current, total_pages):
-                report(f"  page {current}/{total_pages}")
-
-        status, message = convert_pdf_to_epub(
-            plan.source,
-            plan.target,
-            overwrite=overwrite,
-            zoom=zoom,
-            on_page=on_page if progress is not None else None,
-        )
-        report(f"{prefix} done: {status} - {message}")
-        results.append(
-            ConversionResult(
-                source=relative_path(plan.source, base_dir),
-                target=relative_path(plan.target, base_dir),
-                status=status,
-                message=message,
-            )
-        )
-        if fail_fast and status == "failed":
-            break
-
-    if total:
-        report("Done.")
-    return results
+    return on_page
 
 
-def plan_to_results(plans: list[ConversionPlan], base_dir: Path) -> list[ConversionResult]:
-    """Convert dry-run plan entries to result-shaped objects."""
-    return [
-        ConversionResult(
-            source=relative_path(plan.source, base_dir),
-            target=relative_path(plan.target, base_dir),
-            status=plan.status,
-            message=plan.message,
-        )
-        for plan in plans
-    ]
-
-
-def print_results(results: list[ConversionResult], *, dry_run: bool) -> None:
-    """Print a human-readable conversion summary."""
-    print("=" * 60)
-    print("My Bookshelves PDF to EPUB Converter")
-    print("=" * 60)
-    print(f"Mode: {'dry-run' if dry_run else 'execute'}")
-    print()
-
-    if not results:
-        print("No PDF files found.")
-        return
-
-    for result in results:
-        print(f"- [{result.status}] {result.source} -> {result.target}")
-        print(f"  {result.message}")
-
-    counts: dict[str, int] = {}
-    for result in results:
-        counts[result.status] = counts.get(result.status, 0) + 1
-
-    print()
-    print("Summary:")
-    for status in sorted(counts):
-        print(f"- {status}: {counts[status]}")
-
-    if dry_run:
-        print()
-        print("No files changed. Add --execute to create EPUBs.")
-
-
-def main() -> None:
-    """CLI entrypoint."""
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--base-dir", default=".", help="Project root directory")
-    parser.add_argument("--inbox-dir", default="Inbox", help="Inbox directory under base-dir")
-    parser.add_argument("--execute", action="store_true", help="Create EPUB files")
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog=os.environ.get("BOOK_PROG"),
+        description="Convert PDF files in Inbox to image-based EPUB files.",
+    )
+    add_inbox_args(parser, execute_help="Create EPUB files")
     parser.add_argument("--overwrite", action="store_true", help="Replace existing EPUB outputs")
-    parser.add_argument("--fail-fast", action="store_true", help="Stop after the first failure")
     parser.add_argument("--zoom", type=float, default=1.5, help="PDF render zoom for page images")
-    parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
-    args = parser.parse_args()
+    parser.add_argument(
+        "--image-format",
+        choices=tuple(IMAGE_FORMATS),
+        default="jpeg",
+        help=f"Page image format (default: jpeg, quality {JPEG_QUALITY})",
+    )
+    parser.add_argument("--language", default=DEFAULT_LANGUAGE, help="EPUB dc:language code (default: en)")
+    return parser
 
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
     base_dir = Path(args.base_dir).resolve()
 
     try:
         inbox_dir = resolve_inbox_dir(base_dir, args.inbox_dir)
-        plans = build_plan(inbox_dir, overwrite=args.overwrite)
+        plans = build_plan(inbox_dir, PDF_TO_EPUB, overwrite=args.overwrite, files=args.files)
+    except Exception as exc:
+        report_error(exc, as_json=args.json)
+        return EXIT_FAILURE
+
+    if args.execute and not confirm_execution(
+        plans, "Convert these PDF file(s) to EPUB?", assume_yes=args.yes, as_json=args.json
+    ):
+        return EXIT_FAILURE
+
+    try:
         if args.execute:
             progress = make_progress_printer(enabled=not args.json)
-            results = execute_plan(
-                plans,
-                base_dir,
-                overwrite=args.overwrite,
-                zoom=args.zoom,
-                fail_fast=args.fail_fast,
-                progress=progress,
-            )
+
+            def convert_one(plan: ConversionPlan) -> tuple[str, str]:
+                return convert_pdf_to_epub(
+                    plan.source,
+                    plan.target,
+                    overwrite=args.overwrite,
+                    zoom=args.zoom,
+                    image_format=args.image_format,
+                    language=args.language,
+                    on_page=page_progress(progress),
+                )
+
+            results = run_plan(plans, base_dir, convert_one, progress=progress, fail_fast=args.fail_fast)
         else:
             results = plan_to_results(plans, base_dir)
     except Exception as exc:
-        if args.json:
-            emit_json({"ok": False, "error": str(exc)})
-        else:
-            print(f"ERROR: {exc}", file=sys.stderr)
-        sys.exit(1)
+        report_error(exc, as_json=args.json)
+        return EXIT_FAILURE
 
-    ok = all(result.status != "failed" for result in results)
-
-    if args.json:
-        emit_json(
-            {
-                "ok": ok,
-                "dry_run": not args.execute,
-                "results": [result.__dict__ for result in results],
-            }
-        )
-    else:
-        print_results(results, dry_run=not args.execute)
-
-    if not ok:
-        sys.exit(1)
+    return finish(results, PDF_TO_EPUB, dry_run=not args.execute, as_json=args.json)
 
 
 if __name__ == "__main__":
-    main()
+    run_main(main)

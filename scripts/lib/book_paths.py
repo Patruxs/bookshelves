@@ -1,23 +1,45 @@
-"""Path and metadata helpers for book files."""
-
 from __future__ import annotations
 
 import hashlib
 import re
+import unicodedata
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 
-from .constants import BOOK_EXTENSIONS, BOOKS_DIR, CATEGORY_PATTERN
+from .constants import BOOK_EXTENSIONS, BOOKS_DIR, CATEGORY_PATTERN, COVER_EXTENSION
+
+MIN_BOOK_PATH_PARTS = 3
+
+
+def normalize_text(value: str) -> str:
+    return unicodedata.normalize("NFC", value)
 
 
 def sanitize_filename(name: str) -> str:
-    """Create the canonical cover filename stem for a book title."""
-    safe = re.sub(r"[^\w\s\-.]", "", name)
+    safe = re.sub(r"[^\w\s\-.]", "", normalize_text(name))
     safe = re.sub(r"\s+", "_", safe.strip())
     return safe[:100]
 
 
+def cover_filename(title: str) -> str:
+    return sanitize_filename(title) + COVER_EXTENSION
+
+
+def detect_cover_collisions(books: Iterable[Mapping[str, object]]) -> dict[str, list[str]]:
+    titles_by_cover: dict[str, set[str]] = {}
+    for book in books:
+        title = book.get("title")
+        if not isinstance(title, str) or not title:
+            continue
+        titles_by_cover.setdefault(cover_filename(title), set()).add(normalize_text(title))
+    return {
+        cover: sorted(titles)
+        for cover, titles in sorted(titles_by_cover.items())
+        if len(titles) > 1
+    }
+
+
 def parse_category_name(folder_name: str) -> str:
-    """Convert `1_Computer_Science` to `Computer Science`."""
     match = CATEGORY_PATTERN.match(folder_name)
     if match:
         return match.group(2).replace("_", " ")
@@ -25,40 +47,31 @@ def parse_category_name(folder_name: str) -> str:
 
 
 def parse_topic_name(folder_name: str) -> str:
-    """Convert `Data_Structures` to `Data Structures`."""
     return folder_name.replace("_", " ")
 
 
 def display_to_folder_name(display_name: str) -> str:
-    """Convert a display name to the folder-style name."""
     return display_name.replace(" ", "_")
 
 
 def display_topic_from_parts(parts: tuple[str, ...]) -> str:
-    """Convert topic/subtopic folder parts to a display topic."""
     return "/".join(parse_topic_name(part) for part in parts)
 
 
 def generate_book_id(file_path: str) -> str:
-    """Generate a stable 12-character ID from a relative book path."""
-    return hashlib.md5(file_path.encode("utf-8")).hexdigest()[:12]
+    digest = hashlib.md5(normalize_text(file_path).encode("utf-8"), usedforsecurity=False)
+    return digest.hexdigest()[:12]
 
 
 def is_book_file(path: Path) -> bool:
-    """Return True when a path is a supported book file."""
     return path.is_file() and path.suffix.lower() in BOOK_EXTENSIONS
 
 
 def metadata_from_book_path(base_dir: Path, file_path: Path) -> dict[str, object]:
-    """Build canonical metadata from a physical book file path."""
     rel_path = file_path.relative_to(base_dir).as_posix()
-    parts = Path(rel_path).parts
-    if len(parts) < 4 or parts[0] != BOOKS_DIR:
+    category, topic = expected_display_from_file_path(rel_path)
+    if category is None or topic is None:
         raise ValueError(f"Unsupported book path: {rel_path}")
-
-    category = parse_category_name(parts[1])
-    topic_parts = tuple(parts[2:-1])
-    topic = display_topic_from_parts(topic_parts) if topic_parts else category
 
     return {
         "abs_path": file_path,
@@ -73,9 +86,8 @@ def metadata_from_book_path(base_dir: Path, file_path: Path) -> dict[str, object
 
 
 def expected_display_from_file_path(file_path: str) -> tuple[str | None, str | None]:
-    """Return expected `(category, topic)` display values from `file_path`."""
     parts = Path(file_path).parts
-    if len(parts) < 4 or parts[0] != BOOKS_DIR:
+    if len(parts) < MIN_BOOK_PATH_PARTS or parts[0] != BOOKS_DIR:
         return None, None
 
     category = parse_category_name(parts[1])
@@ -84,10 +96,16 @@ def expected_display_from_file_path(file_path: str) -> tuple[str | None, str | N
     return category, topic
 
 
-def format_size(size_bytes: int) -> str:
-    """Format bytes for human-readable output."""
-    mb = size_bytes / (1024 * 1024)
-    if mb >= 1:
-        return f"{mb:.1f} MB"
-    return f"{size_bytes / 1024:.0f} KB"
+BYTES_PER_KB = 1024
+BYTES_PER_MB = BYTES_PER_KB * 1024
+BYTES_PER_GB = BYTES_PER_MB * 1024
 
+
+def format_size(size_bytes: int) -> str:
+    if size_bytes < BYTES_PER_KB:
+        return f"{size_bytes} B"
+    if size_bytes >= BYTES_PER_GB:
+        return f"{size_bytes / BYTES_PER_GB:.1f} GB"
+    if size_bytes >= BYTES_PER_MB:
+        return f"{size_bytes / BYTES_PER_MB:.1f} MB"
+    return f"{size_bytes / BYTES_PER_KB:.0f} KB"

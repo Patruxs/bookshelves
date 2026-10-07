@@ -1,11 +1,4 @@
-# ╔═══════════════════════════════════════════════════════════╗
-# ║  My Bookshelves — .gitignore (Storage Optimized)        ║
-# ║  Books are stored via GitHub Releases, NOT in git tree  ║
-# ╚═══════════════════════════════════════════════════════════╝
 
-# ══════════════════════════════════════════════════
-# 📚 BOOKS — DO NOT TRACK (use GitHub Releases)
-# ══════════════════════════════════════════════════
 *.pdf
 *.epub
 *.docx
@@ -19,9 +12,6 @@
 *.bmp
 *.tiff
 
-# ══════════════════════════════════════════════════
-# 🐍 Python
-# ══════════════════════════════════════════════════
 __pycache__/
 *.py[cod]
 *$py.class
@@ -32,30 +22,20 @@ venv/
 .venv/
 *.egg-info/
 
-# ══════════════════════════════════════════════════
-# 📝 Logs & Temp
-# ══════════════════════════════════════════════════
 auto_organize.log
-ERRORS.md
 *.log
 library_structure.log
 _site/
 .backups/
-site/.backups/
+.cache/
 *.tmp
 *.bak
 
-# ══════════════════════════════════════════════════
-# 💻 OS Files
-# ══════════════════════════════════════════════════
 .DS_Store
 Thumbs.db
 desktop.ini
 ehthumbs.db
 
-# ══════════════════════════════════════════════════
-# 🛠️ IDE
-# ══════════════════════════════════════════════════
 .vscode/
 .idea/
 *.swp
@@ -64,3 +44,6 @@ ehthumbs.db
 node_modules/
 .env
 .env.*
+
+web/node_modules/
+web/dist/

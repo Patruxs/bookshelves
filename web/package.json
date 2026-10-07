@@ -1,0 +1,31 @@
+{
+  "name": "my-bookshelves-web",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@astryxdesign/core": "^0.6.5",
+    "@astryxdesign/theme-neutral": "^0.6.5",
+    "@fontsource-variable/figtree": "^5.3.0",
+    "@fontsource/instrument-serif": "^5.3.0",
+    "@stylexjs/stylex": "^0.19.1",
+    "lucide-react": "^1.52.0",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "react-router-dom": "^7.18.4"
+  },
+  "devDependencies": {
+    "@astryxdesign/cli": "^0.6.5",
+    "@types/node": "^26.6.4",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^5.2.0",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.7"
+  }
+}

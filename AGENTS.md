@@ -1,56 +1,68 @@
-# AGENTS.md
+# Bookshelves
 
-This guide is the entrypoint for Codex when working in the My-Bookshelves repo.
-The `.agents/` directory remains the shared source for both Antigravity and Codex.
-The `.codex/` directory is the Codex-specific adapter and only points back to `.agents/`.
+A personal book library published as a static site at `Patruxs/bookshelves` (GitHub Pages, branch `main`).
 
-## Load Order
-
-1. Always read `.agents/rules/my-bookshelves.md` before editing code, metadata, books, covers, uploads, or workflows.
-2. When the user invokes `/auto-organize`, `auto-organize`, or asks to classify books in `Inbox/`, read:
-   - `.codex/manifest.json`
-   - `.codex/rules.md`
-   - `.codex/workflows/auto-organize.md`
-   - `.agents/workflows/auto-organize.md`
-   - `.agents/skills/auto-organize/SKILL.md`
-   - `.agents/skills/auto-organize/prompts/classify_book.md`
-   - `.agents/skills/auto-organize/config/settings.json`
-3. Even when only editing frontend code, keep the zero-dependency boundary from the project rules.
-
-## Codex Compatibility Map
-
-| Antigravity concept | Codex equivalent |
+| Path | Holds |
 | --- | --- |
-| Slash workflow such as `/auto-organize` | The user can invoke it in plain text; read the file in `.agents/workflows/` and execute the steps |
-| `view_file` | Use a file-reading tool or `Get-Content -Raw` in PowerShell |
-| `multi_replace_file_content` | Use `apply_patch` for batch edits; for large JSON files, prefer existing tools/CLI and validate JSON after editing |
-| `// turbo` comment | Optimization note from Antigravity, not required syntax for Codex |
-| Bash snippets | Run the equivalent command in PowerShell on Windows (`Get-ChildItem`, `New-Item`, `Move-Item`) |
+| `Books/` | Book files, organized by category and topic |
+| `Inbox/` | New books waiting to be organized |
+| `data/data.json` | Generated metadata for every book |
+| `assets/covers/` | Generated cover images |
+| `scripts/` | Python CLI and TUI |
+| `web/` | React 19 + Astryx frontend, built with Vite |
 
-## Operating Rules For Codex
+## Workflow
 
-- The default shell is PowerShell, and the working directory is the repo root.
-- Use `rg`/`rg --files` to search for files and content.
-- Do not commit book files (`*.pdf`, `*.epub`, `*.docx`) to git.
-- Ask the user for one confirmation before bulk renaming/moving books or performing a real upload.
-- Before running `generate`, verify PyMuPDF, Pillow, and python-docx with the active interpreter.
-- Run `python scripts/cli.py generate --base-dir .` only once per batch; if it fails, fix the root cause before retrying.
-- After `generate`, always verify the `download_url` and `topic` for books in subfolders.
-- When writing `category`/`topic` to `site/data.json`, use display names with spaces; do not write `Snake_Case`.
-- Use `python scripts/cli.py doctor --base-dir . --strict` before upload/deploy-sensitive changes.
-- `setup.bat` and `setup.sh` are non-destructive by default; pass `--reset-sample-data` only when a reset is explicitly intended.
-- If a test/build/lint/runtime failure occurs during work, append it to `ERRORS.md` according to the workspace error logging rule.
+1. Drop new books into `Inbox/`.
+2. Run `bookshelves` and pick Auto-Organize (or `./book auto-organize`). The AI agent classifies the batch, writes `.cache/auto-organize-plan.json` and applies it with `./book apply-plan`, which moves the files, runs `generate`, sets descriptions, refreshes the structure log and runs `doctor`.
+3. `./book doctor` to validate. Fix only issues about the current batch.
+4. `./book upload` to preview, then `./book upload --execute` to push the files to GitHub Releases.
+5. Commit and push. GitHub Actions builds `web/` and deploys it.
 
-## Auto-Organize Summary
+Ask the user once before: bulk move or rename, `apply-plan --execute`, real upload, `upload --force`, `upload --hard-reset`, `reset --execute`, git commit or push.
 
-Shared workflow:
+## Rules
 
-1. Scan `Inbox/` and count N new books.
-2. Dry-run the rename; execute only after user approval.
-3. Generate and read `library_structure.log`.
-4. Classify all books in memory, prioritizing existing folders.
-5. Show a summary table and ask the user for one confirmation.
-6. Move the batch into `Books/`.
-7. Verify dependencies, generate covers/data, insert descriptions, and verify metadata.
-8. Dry-run the upload, then perform the real upload only if the count matches N.
-9. Update `library_structure.log`, then commit/push if the workflow or user requests it.
+Files on disk
+
+- Book files (`*.pdf`, `*.epub`, `*.docx`) never go into git. They live on GitHub Releases under tag `storage-v1`.
+- Layout: `Books/{N}_Category/Topic[/SubTopic]/Book_Title.pdf`. Folder and file names are ASCII `Snake_Case`, no diacritics.
+- Covers are WebP, 600px wide, under 80KB.
+
+Metadata
+
+- `data/data.json` and `assets/covers/` contain generated data only. Never put HTML, CSS or JS there.
+- `category` and `topic` use display names with spaces. A book in `Programming_Languages/Java/` has `"topic": "Programming Languages/Java"`.
+- Never drop an existing `download_url` or `description`. If one is lost, restore with `git checkout data/data.json`.
+
+## CLI
+
+Run from the repo root: `./book <command>` (Windows: `book.bat <command>`). `--base-dir` defaults to the repo root.
+
+Contract for every command:
+
+- Commands that change files are dry runs unless `--execute` is given. `--yes` skips the confirmation prompt; without a terminal, `--execute` needs `--yes`.
+- `--json` prints one JSON object on stdout; human output goes to stderr.
+- Exit codes: `0` ok, `1` failure, `2` usage error or confirmation required. A cancel never exits `0`.
+
+| Command | `--execute` | `--yes` | `--json` | Purpose |
+| --- | --- | --- | --- | --- |
+| `list` | | | yes | List books, topics and categories |
+| `generate` | | | yes | Build covers and `data/data.json` from `Books/` (`--dry-run` to preview) |
+| `doctor [--strict]` | | | yes | Validate repo, dependencies, metadata and covers |
+| `smoke` | | | yes | Check data contracts and the web app (uses `web/dist` if built) |
+| `structure` | | | yes | Regenerate `library_structure.log` |
+| `apply-plan PLAN.json` | yes | yes | yes | Apply an Inbox plan `[{file, category, topic, description}]`: move, generate, describe, doctor |
+| `rename` | yes | yes | yes | Normalize filenames in `Books/` and `Inbox/` |
+| `unlock-pdfs` | yes | yes | yes | Strip passwords from PDFs in `Inbox/` |
+| `epub-to-pdf` | yes | yes | yes | Convert EPUBs in `Inbox/` to PDF |
+| `pdf-to-epub` | yes | yes | yes | Convert PDFs in `Inbox/` to image-based EPUB |
+| `upload` | yes | yes | yes | Upload new books to GitHub Releases (`--force` / `--hard-reset` re-upload all, need `--yes`) |
+| `delete --book "Title" [--delete-files]` | yes | yes | yes | Delete a book (`--topic "T" --category "C"` or `--category "C"` for groups) |
+| `update --book "Title" --set-description/--set-category/--set-topic "X"` | yes | yes | yes | Edit book metadata (`--book-id ID` selects by exact id) |
+| `update --topic "Old" --category "C" --rename "New"` | yes | yes | yes | Rename a topic (`--category "Old" --rename "New"` for a category) |
+| `reset` | yes | yes | yes | Move `data/data.json`, covers and the structure log to `.backups/` |
+| `auto-organize [--agent NAME] [--print-prompt] [--print-command] [--unsafe-permissions]` | | | `--list-agents` | Hand `Inbox/` to `claude`, `codex`, `opencode`, `gemini` or `cursor-agent` |
+| `tui` | | | | Open the terminal UI (`scripts/bookshelves_tui/`, Textual) |
+
+`rename --execute` clears `download_url` for renamed files, an exception to the `download_url` rule above: run `upload --execute` afterwards to restore it.

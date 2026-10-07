@@ -1,129 +1,68 @@
 #!/usr/bin/env python3
-"""
-📚 My Bookshelves — Book File Renamer
+from __future__ import annotations
 
-Normalizes ALL book filenames to ASCII-safe, underscore-separated format.
-Removes Vietnamese diacritics and replaces special characters.
-
-Algorithm (Slugify):
-  1. Remove Vietnamese diacritics (đ→d, ă→a, ứ→u, etc.)
-  2. Replace spaces, dots, hyphens, plus, brackets → underscore
-  3. Remove remaining non-alphanumeric chars (except underscore)
-  4. Collapse consecutive underscores → single underscore
-  5. Trim leading/trailing underscores
-
-Examples:
-  'Kiến trúc ứng dụng web.epub'     → 'Kien_truc_ung_dung_web.epub'
-  'Ch05a_Mo.hinh.hoa.quy.trinh.pdf' → 'Ch05a_Mo_hinh_hoa_quy_trinh.pdf'
-  'Go With Domain.pdf'              → 'Go_With_Domain.pdf'
-  'Head First Java 2nd Edition.pdf' → 'Head_First_Java_2nd_Edition.pdf'
-
-Usage:
-    python scripts/rename_books.py --base-dir .              # Dry-run (preview)
-    python scripts/rename_books.py --base-dir . --execute     # Actually rename
-"""
-
+import argparse
 import os
 import re
 import sys
-import json
-import argparse
 import unicodedata
 from pathlib import Path
 
-from lib.json_io import write_json_atomic
-from lib.output import emit_json, to_jsonable
+from lib.book_paths import generate_book_id
+from lib.cli_common import (
+    EXIT_FAILURE,
+    EXIT_OK,
+    add_base_dir_arg,
+    add_json_arg,
+    add_mode_args,
+    confirm,
+    execute_command,
+    json_mode,
+    run_main,
+)
+from lib.constants import BOOK_EXTENSIONS, BOOKS_DIR, DATA_JSON, DEFAULT_RELEASE_TAG, INBOX_DIR
+from lib.json_io import load_books, save_books
+from lib.output import emit_json
 
-# Fix Windows console encoding for Vietnamese/Unicode output
-if sys.stdout.encoding != 'utf-8':
-    sys.stdout.reconfigure(encoding='utf-8')
-if sys.stderr.encoding != 'utf-8':
-    sys.stderr.reconfigure(encoding='utf-8')
+COMMAND_NAME = "rename"
+SCAN_DIRS = [BOOKS_DIR, INBOX_DIR]
+TRANSLITERATIONS = str.maketrans({
+    "đ": "d", "Đ": "D",
+    "ß": "ss",
+    "ø": "o", "Ø": "O",
+    "æ": "ae", "Æ": "AE",
+    "œ": "oe", "Œ": "OE",
+    "ł": "l", "Ł": "L",
+})
 
-
-# ══════════════════════════════════════════════════════════
-# CONFIGURATION
-# ══════════════════════════════════════════════════════════
-
-BOOK_EXTENSIONS = {".pdf", ".epub", ".docx"}
-DATA_JSON = "site/data.json"
-SCAN_DIRS = ["Books", "Inbox"]
-
-
-# ══════════════════════════════════════════════════════════
-# CORE: FILENAME NORMALIZATION
-# ══════════════════════════════════════════════════════════
 
 def remove_diacritics(text: str) -> str:
-    """Remove Vietnamese diacritics using Unicode NFD decomposition.
-
-    Handles đ/Đ specially since they don't decompose via NFD.
-    All other Vietnamese chars (ă, â, ê, ô, ơ, ư + tone marks)
-    are decomposed into base letter + combining marks, then marks are stripped.
-
-    Args:
-        text: Input string with possible Vietnamese diacritics.
-
-    Returns:
-        String with all diacritics removed.
-    """
-    # đ/Đ are special: NFD doesn't decompose them
-    text = text.replace('đ', 'd').replace('Đ', 'D')
-    # NFD decomposition splits accented chars into base + combining marks
+    text = text.translate(TRANSLITERATIONS)
     nfkd = unicodedata.normalize('NFD', text)
-    # Strip all combining marks (category 'Mn' = Mark, Nonspacing)
     return ''.join(c for c in nfkd if unicodedata.category(c) != 'Mn')
 
 
 def slugify_filename(filename: str) -> str:
-    """Convert a filename to ASCII-safe, underscore-separated format.
-
-    Args:
-        filename: Original filename (e.g. "Kiến trúc ứng dụng web.epub").
-
-    Returns:
-        Normalized filename (e.g. "Kien_truc_ung_dung_web.epub").
-    """
     stem = Path(filename).stem
     ext = Path(filename).suffix.lower()
 
-    # Step 1: Remove Vietnamese diacritics
     stem = remove_diacritics(stem)
 
-    # Step 2: Replace special characters with underscore
-    # Covers: spaces, dots, hyphens, plus, brackets, and other punctuation
     stem = re.sub(r'[\s.\-+\(\)\[\],;:!?@#$%^&*={}|\\/<>\'"~`]', '_', stem)
 
-    # Step 3: Remove any remaining non-alphanumeric chars (except underscore)
     stem = re.sub(r'[^a-zA-Z0-9_]', '_', stem)
 
-    # Step 4: Collapse multiple consecutive underscores
     stem = re.sub(r'_+', '_', stem)
 
-    # Step 5: Trim leading/trailing underscores
     stem = stem.strip('_')
 
     if not stem:
-        return filename  # Safety: don't create empty filenames
+        return filename
 
     return f"{stem}{ext}"
 
 
-# ══════════════════════════════════════════════════════════
-# SCAN & PLAN
-# ══════════════════════════════════════════════════════════
-
 def scan_and_plan(base_dir: Path) -> list[dict]:
-    """Scan directories and create a rename plan.
-
-    Only includes files that NEED renaming (old name != new name).
-
-    Args:
-        base_dir: Project root directory.
-
-    Returns:
-        List of dicts with old_path, new_path, old_name, new_name, old_rel, new_rel.
-    """
     plan = []
 
     for scan_dir_name in SCAN_DIRS:
@@ -131,7 +70,7 @@ def scan_and_plan(base_dir: Path) -> list[dict]:
         if not scan_dir.exists():
             continue
 
-        for root, dirs, files in os.walk(scan_dir):
+        for root, _dirs, files in os.walk(scan_dir):
             root_path = Path(root)
             for filename in sorted(files):
                 file_path = root_path / filename
@@ -149,161 +88,241 @@ def scan_and_plan(base_dir: Path) -> list[dict]:
                         "new_name": new_name,
                         "old_rel": file_path.relative_to(base_dir).as_posix(),
                         "new_rel": new_path.relative_to(base_dir).as_posix(),
+                        "collision": None,
                     })
 
+    mark_collisions(plan)
     return plan
 
 
-# ══════════════════════════════════════════════════════════
-# DATA.JSON UPDATE
-# ══════════════════════════════════════════════════════════
+def target_key(path: Path) -> str:
+    return path.as_posix().casefold()
 
-def update_data_json(base_dir: Path, renamed_items: list[dict]) -> int:
-    """Update file_path in data.json for successfully renamed files.
 
-    Also clears download_url since old URLs are now invalid
-    (files will be re-uploaded with new names via --hard-reset).
+def mark_collisions(plan: list[dict]) -> None:
+    sources_by_target: dict[str, list[dict]] = {}
+    for item in plan:
+        sources_by_target.setdefault(target_key(item["new_path"]), []).append(item)
 
-    Args:
-        base_dir: Project root directory.
-        renamed_items: List of successfully renamed items.
+    for items in sources_by_target.values():
+        if len(items) > 1:
+            names = ", ".join(item["old_rel"] for item in items)
+            for item in items:
+                item["collision"] = f"{len(items)} files would be renamed to {item['new_rel']}: {names}"
 
-    Returns:
-        Number of entries updated.
-    """
-    data_path = base_dir / DATA_JSON
-    if not data_path.exists():
-        print("   ⚠️  data.json not found, skipping update")
-        return 0
+    for item in plan:
+        new_path = item["new_path"]
+        if item["collision"] is None and new_path.exists() and not new_path.samefile(item["old_path"]):
+            item["collision"] = f"target already exists: {item['new_rel']}"
 
-    with open(data_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
 
-    # Build mapping: old_rel → new_rel
+def entries_losing_download_url(books: list[dict], plan: list[dict]) -> list[dict]:
+    renamed_paths = {item["old_rel"]: item["new_rel"] for item in plan if item["collision"] is None}
+    return [
+        {
+            "id": entry.get("id"),
+            "title": entry.get("title"),
+            "file_path": entry.get("file_path"),
+            "new_file_path": renamed_paths[entry["file_path"]],
+            "download_url": entry.get("download_url"),
+        }
+        for entry in books
+        if entry.get("file_path") in renamed_paths and entry.get("download_url")
+    ]
+
+
+def update_data_json(base_dir: Path, books: list[dict], renamed_items: list[dict]) -> int:
     path_map = {item["old_rel"]: item["new_rel"] for item in renamed_items}
 
     updated = 0
-    for entry in data:
+    for entry in books:
         old_fp = entry.get("file_path", "")
         if old_fp in path_map:
             entry["file_path"] = path_map[old_fp]
-            # Clear download_url — will be re-set after upload_releases.py --hard-reset
+            entry["id"] = generate_book_id(entry["file_path"])
             entry["download_url"] = ""
             updated += 1
 
-    write_json_atomic(data_path, data, backup=True)
+    if updated:
+        save_books(base_dir, books, backup=True)
 
     return updated
 
 
-# ══════════════════════════════════════════════════════════
-# MAIN
-# ══════════════════════════════════════════════════════════
+def rename_file(old_path: Path, new_path: Path) -> None:
+    if new_path.exists() and not new_path.samefile(old_path):
+        raise FileExistsError(f"target exists: {new_path.name}")
+    if new_path.exists():
+        temporary = old_path.with_name(f".{old_path.name}.renaming")
+        old_path.rename(temporary)
+        temporary.rename(new_path)
+        return
+    old_path.rename(new_path)
 
-def main():
-    """Main entry point."""
-    parser = argparse.ArgumentParser(
-        description="📚 Normalize book filenames to ASCII-safe, underscore-separated format"
-    )
-    parser.add_argument("--base-dir", default=".", help="Project root directory")
-    parser.add_argument("--execute", action="store_true",
-                        help="Actually rename files (default: dry-run preview)")
-    parser.add_argument("--json", action="store_true", help="Emit a machine-readable JSON summary")
-    args = parser.parse_args()
 
-    base_dir = Path(args.base_dir).resolve()
+def print_plan(plan: list[dict]) -> None:
+    print(f"📋 Found {len(plan)} files to rename:\n")
+    for index, item in enumerate(plan, 1):
+        print(f"  {index:2d}. ❌ {item['old_name']}")
+        print(f"      ✅ {item['new_name']}")
+        if item["collision"]:
+            print(f"      ⚠️  COLLISION, will be skipped: {item['collision']}")
+        print()
 
+
+def print_cleared_download_urls(cleared: list[dict]) -> None:
+    if not cleared:
+        return
+    print(f"🔗 {len(cleared)} data.json entr{'y' if len(cleared) == 1 else 'ies'} will lose download_url "
+          "(re-upload needed):")
+    for entry in cleared:
+        print(f"   - {entry['title']} ({entry['file_path']})")
+    print()
+
+
+def load_books_if_present(base_dir: Path) -> list[dict] | None:
+    if not (base_dir / DATA_JSON).exists():
+        return None
+    return load_books(base_dir)
+
+
+def run_rename(base_dir: Path, *, execute: bool, assume_yes: bool, argv: list[str]) -> dict:
     print("=" * 60)
     print("📚 My Bookshelves — Book File Renamer")
     print("=" * 60)
     print(f"📂 Base directory: {base_dir}")
-    print(f"🔧 Mode: {'🚀 EXECUTE' if args.execute else '👀 DRY-RUN (preview only)'}\n")
+    print(f"🔧 Mode: {'🚀 EXECUTE' if execute else '👀 DRY-RUN (preview only)'}\n")
 
-    # ── Scan and plan ──
+    try:
+        books = load_books_if_present(base_dir)
+    except ValueError as exc:
+        print(f"❌ Cannot read {DATA_JSON}: {exc}")
+        print("   No files were renamed.")
+        return {"ok": False, "error": f"Cannot read {DATA_JSON}: {exc}", "renamed": 0}
+
     plan = scan_and_plan(base_dir)
+    collisions = [item for item in plan if item["collision"]]
+    cleared = entries_losing_download_url(books or [], plan)
 
     if not plan:
-        if args.json:
-            emit_json({"ok": True, "dry_run": not args.execute, "planned": 0, "renamed": 0})
-            return
         print("✅ All filenames are already normalized! Nothing to rename.")
-        return
+        return {"ok": True, "dry_run": not execute, "planned": 0, "renamed": 0, "download_url_cleared": []}
 
-    # ── Show plan ──
-    print(f"📋 Found {len(plan)} files to rename:\n")
-    for i, item in enumerate(plan, 1):
-        print(f"  {i:2d}. ❌ {item['old_name']}")
-        print(f"      ✅ {item['new_name']}")
-        print()
+    print_plan(plan)
+    print_cleared_download_urls(cleared)
+    if collisions:
+        print(f"⚠️  {len(collisions)} file(s) collide and will be skipped; rename them by hand first.\n")
 
-    if not args.execute:
-        if args.json:
-            emit_json({
-                "ok": True,
-                "dry_run": True,
-                "planned": len(plan),
-                "renames": to_jsonable(plan),
-            })
-            return
+    if not execute:
+        rerun_command = execute_command(COMMAND_NAME, argv)
         print("─" * 60)
         print("ℹ️  DRY-RUN mode. No files were renamed.")
-        print("   To execute, add --execute flag:")
-        print(f"   python scripts/rename_books.py --base-dir . --execute")
-        return
+        print("   To execute, run:")
+        print(f"   {rerun_command}")
+        return {
+            "ok": True,
+            "dry_run": True,
+            "planned": len(plan),
+            "collisions": len(collisions),
+            "renames": plan,
+            "download_url_cleared": cleared,
+            "execute_command": rerun_command,
+        }
 
-    # ── Execute renames ──
+    if books is None:
+        print(f"⚠️  {DATA_JSON} not found; renaming files without updating it.\n")
+
+    renamable = [item for item in plan if not item["collision"]]
+    if not renamable:
+        print("❌ Every planned rename collides. Nothing was renamed.")
+        return {"ok": False, "dry_run": False, "planned": len(plan), "collisions": len(collisions), "renamed": 0,
+                "renames": plan, "download_url_cleared": []}
+
+    if not confirm(f"Rename {len(renamable)} file(s)?", assume_yes=assume_yes):
+        print("\n❌ Cancelled. No files were renamed.")
+        return {"ok": False, "cancelled": True, "renamed": 0}
+
     print("─" * 60)
     print("🚀 Executing renames...\n")
 
     renamed_items = []
     errors = 0
+    updated = 0
 
-    for item in plan:
-        try:
-            # Check for filename conflicts
-            if item["new_path"].exists():
-                print(f"  ⚠️  SKIP (target exists): {item['old_name']}")
+    try:
+        for item in renamable:
+            try:
+                rename_file(item["old_path"], item["new_path"])
+            except OSError as e:
+                print(f"  ⚠️  SKIP {item['old_name']}: {e}")
                 errors += 1
                 continue
-
-            item["old_path"].rename(item["new_path"])
             print(f"  ✅ {item['old_name']} → {item['new_name']}")
             renamed_items.append(item)
-        except Exception as e:
-            print(f"  ❌ {item['old_name']}: {e}")
-            errors += 1
+    finally:
+        if books is not None and renamed_items:
+            print(f"\n{'─' * 60}")
+            print("📝 Updating data.json...")
+            updated = update_data_json(base_dir, books, renamed_items)
+            print(f"   ✅ Updated {updated} entries (file_path + id, cleared download_url)")
 
-    # ── Update data.json ──
-    print(f"\n{'─' * 60}")
-    print("📝 Updating data.json...")
-    updated = update_data_json(base_dir, renamed_items)
-    print(f"   ✅ Updated {updated} entries (file_path + cleared download_url)")
-
-    # ── Summary ──
-    if args.json:
-        emit_json({
-            "ok": errors == 0,
-            "dry_run": False,
-            "planned": len(plan),
-            "renamed": len(renamed_items),
-            "skipped": errors,
-            "data_json_updated": updated,
-            "renames": to_jsonable(renamed_items),
-        })
-        return
+    renamed_paths = {item["old_rel"] for item in renamed_items}
+    cleared_done = [entry for entry in cleared if entry["file_path"] in renamed_paths]
 
     print(f"\n{'═' * 60}")
-    print(f"📊 Summary:")
+    print("📊 Summary:")
     print(f"   ✅ Renamed:  {len(renamed_items)} files")
     if errors:
         print(f"   ⚠️  Skipped:  {errors}")
+    if collisions:
+        print(f"   ⚠️  Collisions skipped: {len(collisions)}")
     print(f"   📝 Updated:  {updated} data.json entries")
-    print(f"\n   📌 Next steps (migration):")
-    print(f"   1. python scripts/generate_data.py --base-dir .      # Regenerate covers + data")
-    print(f"   2. python scripts/upload_releases.py --hard-reset     # Delete old release, re-upload all")
-    print(f"   3. git add -A && git commit && git push               # Deploy")
+    print("\n   📌 Next steps:")
+    print("   1. ./book upload --execute                           # Re-upload entries whose download_url was cleared")
+    print(f"   2. (optional) gh release delete-asset {DEFAULT_RELEASE_TAG} <old_name>   # Remove old assets")
+    print("   3. git add -A && git commit && git push               # Deploy")
     print(f"{'═' * 60}")
+
+    return {
+        "ok": errors == 0 and not collisions,
+        "dry_run": False,
+        "planned": len(plan),
+        "renamed": len(renamed_items),
+        "skipped": errors,
+        "collisions": len(collisions),
+        "data_json_updated": updated,
+        "renames": renamed_items,
+        "download_url_cleared": cleared_done,
+    }
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog=os.environ.get("BOOK_PROG"),
+        description="📚 Normalize book filenames to ASCII-safe, underscore-separated format",
+    )
+    add_base_dir_arg(parser)
+    add_mode_args(parser, execute_help="Actually rename files (default: dry-run preview)")
+    add_json_arg(parser)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    raw_args = sys.argv[1:] if argv is None else argv
+    args = build_parser().parse_args(raw_args)
+    base_dir = Path(args.base_dir).resolve()
+
+    with json_mode(args.json):
+        try:
+            result = run_rename(base_dir, execute=args.execute, assume_yes=args.yes, argv=raw_args)
+        except OSError as exc:
+            print(f"\n❌ {exc}")
+            result = {"ok": False, "error": str(exc)}
+
+    if args.json:
+        emit_json(result)
+    return EXIT_OK if result["ok"] else EXIT_FAILURE
 
 
 if __name__ == "__main__":
-    main()
+    run_main(main)

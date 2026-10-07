@@ -1,564 +1,437 @@
 #!/usr/bin/env python3
-"""
-📚 My Bookshelves — Book Updater
-
-Update book metadata, rename topics, or rename categories in the library.
-Modifies entries in data.json, and optionally moves physical files/folders.
-
-Usage:
-    # Update a book's description
-    python scripts/update_books.py --book "Title" --set-description "New desc"
-
-    # Move a book to a different category
-    python scripts/update_books.py --book "Title" --set-category "New Category"
-
-    # Move a book to a different topic
-    python scripts/update_books.py --book "Title" --set-topic "New Topic"
-
-    # Rename a topic (all books in it)
-    python scripts/update_books.py --topic "Old Topic" --category "Cat" --rename "New Topic"
-
-    # Rename a category (all books in it)
-    python scripts/update_books.py --category "Old Category" --rename "New Category"
-
-    # Preview mode (default — no changes made)
-    python scripts/update_books.py --book "Title" --set-topic "New"
-
-    # Execute update
-    python scripts/update_books.py --book "Title" --set-topic "New" --execute
-
-    # List all books/topics/categories
-    python scripts/update_books.py --list
-"""
+from __future__ import annotations
 
 import argparse
-import json
-import subprocess
+import os
 import sys
-from pathlib import Path
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
 
+from lib.book_paths import (
+    display_to_folder_name,
+    expected_display_from_file_path,
+    generate_book_id,
+    parse_category_name,
+)
+from lib.cli_common import (
+    EXIT_FAILURE,
+    EXIT_OK,
+    add_base_dir_arg,
+    add_json_arg,
+    add_mode_args,
+    confirm,
+    execute_command,
+    json_mode,
+    refresh_structure_log,
+    run_main,
+)
+from lib.constants import BOOKS_DIR, CATEGORY_PATTERN, DATA_JSON
 from lib.json_io import load_books, save_books
 from lib.output import emit_json
+from lib.selection import (
+    Selection,
+    SelectionError,
+    build_library_tree,
+    list_library,
+    match_key,
+    remove_empty_parents,
+    resolve_selection,
+)
 
-# Fix Windows console encoding
-if sys.stdout.encoding != 'utf-8':
-    sys.stdout.reconfigure(encoding='utf-8')
-if sys.stderr.encoding != 'utf-8':
-    sys.stderr.reconfigure(encoding='utf-8')
-
-
-# ══════════════════════════════════════════════════════════
-# CONFIGURATION
-# ══════════════════════════════════════════════════════════
-
-DATA_JSON = "site/data.json"
-COVERS_DIR = "site/assets/covers"
-BOOKS_DIR = "Books"
+COMMAND_NAME = "update"
+DESCRIPTION_PREVIEW_LENGTH = 60
 
 
-# ══════════════════════════════════════════════════════════
-# DATA LOADING
-# ══════════════════════════════════════════════════════════
+class UpdateError(Exception):
+    pass
+
+
+@dataclass(frozen=True)
+class Changes:
+    description: str | None = None
+    category: str | None = None
+    keep_category_prefix: bool = False
+    topic: str | None = None
+    replaced_topic: str | None = None
+
+
+@dataclass(frozen=True)
+class PlannedUpdate:
+    book: dict
+    new_file_path: str
+    new_description: str | None
+
+    @property
+    def old_file_path(self) -> str:
+        return self.book.get("file_path") or ""
+
+    @property
+    def moves(self) -> bool:
+        return self.new_file_path != self.old_file_path
+
+    @property
+    def changes_description(self) -> bool:
+        return self.new_description is not None and self.new_description != self.book.get("description")
+
+    def updated_entry(self) -> dict:
+        entry = dict(self.book)
+        if self.moves:
+            category, topic = expected_display_from_file_path(self.new_file_path)
+            entry["id"] = generate_book_id(self.new_file_path)
+            entry["category"] = category
+            entry["topic"] = topic
+            entry["file_path"] = self.new_file_path
+        if self.new_description is not None:
+            entry["description"] = self.new_description
+        return entry
+
 
 def load_data(base_dir: Path) -> list[dict]:
-    """Load books from data.json."""
     data_path = base_dir / DATA_JSON
     if not data_path.exists():
-        print(f"❌ data.json not found at: {data_path}")
-        sys.exit(1)
+        raise UpdateError(f"data.json not found at: {data_path}")
     return load_books(base_dir)
 
 
-def save_data(base_dir: Path, books: list[dict]) -> None:
-    """Save books to data.json."""
-    data_path = base_dir / DATA_JSON
-    save_books(base_dir, books, backup=True)
+def topic_folders(topic: str) -> list[str]:
+    return [display_to_folder_name(part.strip()) for part in topic.split("/") if part.strip()]
 
 
-# ══════════════════════════════════════════════════════════
-# LISTING
-# ══════════════════════════════════════════════════════════
-
-def build_library_tree(books: list[dict]) -> dict[str, dict[str, list[str]]]:
-    """Build a category/topic/title tree."""
-    tree: dict[str, dict[str, list[str]]] = {}
-    for b in books:
-        cat = b.get("category", "Unknown")
-        topic = b.get("topic", "Unknown")
-        title = b.get("title", "Unknown")
-        tree.setdefault(cat, {}).setdefault(topic, []).append(title)
-    return tree
+def category_folders(books_root: Path) -> list[str]:
+    if not books_root.is_dir():
+        return []
+    return sorted(
+        folder.name for folder in books_root.iterdir() if folder.is_dir() and CATEGORY_PATTERN.match(folder.name)
+    )
 
 
-def list_library(base_dir: Path) -> None:
-    """Print all categories, topics, and book counts."""
-    books = load_data(base_dir)
-    tree = build_library_tree(books)
-
-    print(f"\n📚 Library Overview ({len(books)} books total)\n")
-    print("=" * 60)
-    for cat in sorted(tree.keys()):
-        cat_count = sum(len(t) for t in tree[cat].values())
-        print(f"\n📂 {cat} ({cat_count} books)")
-        for topic in sorted(tree[cat].keys()):
-            titles = tree[cat][topic]
-            print(f"   📌 {topic} ({len(titles)} books)")
-            for title in sorted(titles):
-                print(f"      • {title.replace('_', ' ')}")
-    print(f"\n{'=' * 60}")
+def find_category_folder(books_root: Path, category: str) -> str | None:
+    wanted = match_key(category)
+    for folder_name in category_folders(books_root):
+        if match_key(parse_category_name(folder_name)) == wanted:
+            return folder_name
+    return None
 
 
-# ══════════════════════════════════════════════════════════
-# BOOK SELECTION
-# ══════════════════════════════════════════════════════════
-
-def find_books_by_title(books: list[dict], query: str) -> list[dict]:
-    """Find books matching a title (case-insensitive, partial match)."""
-    q = query.lower().replace(" ", "_")
-    return [b for b in books if q in b.get("title", "").lower()]
+def next_category_number(books_root: Path) -> int:
+    numbers = [int(CATEGORY_PATTERN.match(name).group(1)) for name in category_folders(books_root)]
+    return max(numbers, default=0) + 1
 
 
-def find_books_by_id(books: list[dict], book_id: str) -> list[dict]:
-    """Find a book by exact ID."""
-    return [b for b in books if b.get("id", "") == book_id]
+def resolve_category_folder(books_root: Path, current_folder: str, category: str, *, keep_prefix: bool) -> str:
+    existing = find_category_folder(books_root, category)
+    if existing is not None and not (keep_prefix and existing == current_folder):
+        return existing
+    current_match = CATEGORY_PATTERN.match(current_folder)
+    if keep_prefix and current_match:
+        return f"{current_match.group(1)}_{display_to_folder_name(category)}"
+    return f"{next_category_number(books_root)}_{display_to_folder_name(category)}"
 
 
-def find_books_by_topic(books: list[dict], topic: str, category: str) -> list[dict]:
-    """Find all books in a specific topic within a category."""
-    return [
-        b for b in books
-        if b.get("topic", "").lower() == topic.lower()
-        and b.get("category", "").lower() == category.lower()
+def planned_file_path(book: dict, changes: Changes, books_root: Path) -> str:
+    file_path = book.get("file_path") or ""
+    parts = PurePosixPath(file_path).parts
+    if len(parts) < 3 or parts[0] != BOOKS_DIR:
+        raise UpdateError(f"Cannot move {book.get('title', '?')}: unsupported file_path {file_path!r}")
+
+    category_folder = parts[1]
+    topic_parts = list(parts[2:-1])
+    if changes.category is not None:
+        category_folder = resolve_category_folder(
+            books_root, category_folder, changes.category, keep_prefix=changes.keep_category_prefix
+        )
+    if changes.topic is not None:
+        replaced_depth = len(topic_folders(changes.replaced_topic)) if changes.replaced_topic is not None else len(topic_parts)
+        topic_parts = topic_folders(changes.topic) + topic_parts[replaced_depth:]
+    return PurePosixPath(BOOKS_DIR, category_folder, *topic_parts, parts[-1]).as_posix()
+
+
+def plan_updates(base_dir: Path, books: list[dict], targets: list[dict], changes: Changes) -> list[PlannedUpdate]:
+    books_root = base_dir / BOOKS_DIR
+    plan = [
+        PlannedUpdate(book, planned_file_path(book, changes, books_root), changes.description)
+        for book in targets
     ]
 
+    target_ids = {id(book) for book in targets}
+    other_paths = {book.get("file_path") for book in books if id(book) not in target_ids}
+    seen_paths: set[str] = set()
+    for update in plan:
+        if update.new_file_path in seen_paths or update.new_file_path in other_paths:
+            raise UpdateError(f"Two books would end up at {update.new_file_path}")
+        seen_paths.add(update.new_file_path)
+        if not update.moves:
+            continue
+        source = base_dir / update.old_file_path
+        target = base_dir / update.new_file_path
+        if source.exists() and target.exists() and not target.samefile(source):
+            raise UpdateError(f"Target already exists: {update.new_file_path}")
+    return [update for update in plan if update.moves or update.changes_description]
 
-def find_books_by_category(books: list[dict], category: str) -> list[dict]:
-    """Find all books in a specific category."""
-    return [b for b in books if b.get("category", "").lower() == category.lower()]
+
+def shorten(text: str) -> str:
+    return text if len(text) <= DESCRIPTION_PREVIEW_LENGTH else text[:DESCRIPTION_PREVIEW_LENGTH] + "..."
 
 
-# ══════════════════════════════════════════════════════════
-# UPDATE LOGIC
-# ══════════════════════════════════════════════════════════
-
-def preview_book_updates(targets: list[dict], field: str, new_value: str) -> None:
-    """Display preview of what will change for each book."""
-    print(f"\n📝 Changes to be applied ({len(targets)} book(s)):\n")
-    for b in targets:
-        title = b.get("title", "?").replace("_", " ")
-        old_value = b.get(field, "")
-        if field == "description":
-            old_preview = (old_value[:60] + "...") if len(old_value) > 60 else old_value
-            new_preview = (new_value[:60] + "...") if len(new_value) > 60 else new_value
-            print(f"  📖 {title}")
-            print(f"     {field}: \"{old_preview}\"")
-            print(f"          → \"{new_preview}\"")
-        else:
-            print(f"  📖 {title}")
-            print(f"     {field}: \"{old_value}\" → \"{new_value}\"")
+def print_plan(base_dir: Path, plan: list[PlannedUpdate]) -> None:
+    print(f"\n📝 Changes to be applied ({len(plan)} book(s)):\n")
+    for update in plan:
+        print(f"  📖 {update.book.get('title', '?').replace('_', ' ')}")
+        if update.moves:
+            new_category, new_topic = expected_display_from_file_path(update.new_file_path)
+            local_note = "" if (base_dir / update.old_file_path).exists() else "  (not on disk; path only)"
+            print(f"     move: {update.old_file_path}")
+            print(f"        → {update.new_file_path}{local_note}")
+            print(f"     category: \"{update.book.get('category', '')}\" → \"{new_category}\"")
+            print(f"     topic: \"{update.book.get('topic', '')}\" → \"{new_topic}\"")
+        if update.changes_description:
+            print(f"     description: \"{shorten(update.book.get('description') or '')}\"")
+            print(f"               → \"{shorten(update.new_description or '')}\"")
         print()
 
 
-def apply_book_updates(books: list[dict], target_ids: set[str],
-                       field: str, new_value: str) -> int:
-    """Apply field updates to matching books in the full list.
-
-    Args:
-        books: Full book list (modified in-place).
-        target_ids: IDs of books to update.
-        field: Field name to update.
-        new_value: New value for the field.
-
-    Returns:
-        Number of books updated.
-    """
-    updated = 0
-    for b in books:
-        if b.get("id") in target_ids:
-            b[field] = new_value
-            updated += 1
-    return updated
+def rollback_moves(base_dir: Path, moves: list[tuple[Path, Path]]) -> list[str]:
+    failures: list[str] = []
+    for source, target in reversed(moves):
+        try:
+            target.rename(source)
+        except OSError as exc:
+            failures.append(f"{target} → {source}: {exc}")
+    remove_empty_parents(base_dir / BOOKS_DIR, [target for _, target in moves])
+    return failures
 
 
-def update_file_paths(books: list[dict], target_ids: set[str],
-                      old_category: str, new_category: str,
-                      old_topic: str, new_topic: str) -> int:
-    """Update file_path fields when category/topic changes.
-
-    Replaces the category folder name and/or topic folder name in file_path.
-
-    Args:
-        books: Full book list (modified in-place).
-        target_ids: IDs of books to update.
-        old_category/new_category: Category folder names.
-        old_topic/new_topic: Topic folder names.
-
-    Returns:
-        Number of paths updated.
-    """
-    updated = 0
-    for b in books:
-        if b.get("id") not in target_ids:
+def move_files(base_dir: Path, plan: list[PlannedUpdate]) -> list[tuple[Path, Path]]:
+    done: list[tuple[Path, Path]] = []
+    for update in plan:
+        if not update.moves:
             continue
-        fp = b.get("file_path", "")
-        if not fp:
+        source = base_dir / update.old_file_path
+        if not source.exists():
             continue
-
-        parts = Path(fp).parts
-        # Expected: ('Books', 'N_Category', 'Topic', [...], 'file.ext')
-        if len(parts) < 4:
-            continue
-
-        new_parts = list(parts)
-        changed = False
-
-        # Update category folder (index 1)
-        if old_category and new_category and parts[1] != new_category:
-            # Find the matching category folder
-            cat_display = parts[1].split("_", 1)
-            if len(cat_display) >= 2:
-                # Keep the numeric prefix, replace the name
-                prefix = cat_display[0]
-                new_cat_folder = f"{prefix}_{new_category.replace(' ', '_')}"
-                new_parts[1] = new_cat_folder
-                changed = True
-
-        # Update topic folder (index 2)
-        if old_topic and new_topic:
-            new_topic_folder = new_topic.replace(" ", "_")
-            new_parts[2] = new_topic_folder
-            changed = True
-
-        if changed:
-            b["file_path"] = "/".join(new_parts)
-            updated += 1
-
-    return updated
+        target = base_dir / update.new_file_path
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            source.rename(target)
+        except OSError as exc:
+            failures = rollback_moves(base_dir, done)
+            message = f"Moving {update.old_file_path} failed: {exc}. Rolled back {len(done)} move(s); data.json untouched."
+            if failures:
+                message += " Rollback failures:\n" + "\n".join(failures)
+            raise UpdateError(message) from exc
+        done.append((source, target))
+        print(f"  📦 {update.old_file_path} → {update.new_file_path}")
+    return done
 
 
-def update_structure_log(base_dir: Path) -> None:
-    """Regenerate library_structure.log."""
-    script = base_dir / "scripts" / "generate_structure_log.py"
-    if not script.exists():
-        print("  ⚠️  generate_structure_log.py not found, skipping")
-        return
+def change_summary(update: PlannedUpdate) -> dict:
+    new_entry = update.updated_entry()
+    return {
+        "id": update.book.get("id"),
+        "title": update.book.get("title"),
+        "old_file_path": update.old_file_path,
+        "new_file_path": update.new_file_path,
+        "new_id": new_entry.get("id"),
+        "old_category": update.book.get("category"),
+        "new_category": new_entry.get("category"),
+        "old_topic": update.book.get("topic"),
+        "new_topic": new_entry.get("topic"),
+        "description_changed": update.changes_description,
+    }
+
+
+def run_update(
+    base_dir: Path,
+    books: list[dict],
+    selection: Selection,
+    changes: Changes,
+    *,
+    execute: bool,
+    assume_yes: bool,
+    argv: list[str],
+) -> dict:
+    targets = selection.books
+    plan = plan_updates(base_dir, books, targets, changes)
+    summary = [change_summary(update) for update in plan]
+    selection_report = {"selected": len(targets), **selection.report()}
+
+    if not plan:
+        print("\n✅ Nothing to change: the selected book(s) already match.")
+        return {"ok": True, "dry_run": not execute, **selection_report, "changes": []}
+
+    print_plan(base_dir, plan)
+
+    if not execute:
+        rerun_command = execute_command(COMMAND_NAME, argv)
+        print("─" * 60)
+        print("ℹ️  DRY-RUN. No changes made. To apply, run:")
+        print(f"   {rerun_command}")
+        return {
+            "ok": True,
+            "dry_run": True,
+            **selection_report,
+            "changes": summary,
+            "execute_command": rerun_command,
+        }
+
+    if not confirm(f"Apply these changes to {len(plan)} book(s)?", assume_yes=assume_yes):
+        print("\n❌ Cancelled.")
+        return {"ok": False, "cancelled": True, **selection_report}
+
+    print(f"\n{'─' * 60}")
+    print("🚀 Applying updates...\n")
+    moves = move_files(base_dir, plan)
+
+    replacements = {id(update.book): update.updated_entry() for update in plan}
+    updated_books = [replacements.get(id(book), book) for book in books]
     try:
-        subprocess.run(
-            [sys.executable, str(script), "--base-dir", str(base_dir)],
-            check=True, capture_output=True, text=True,
-        )
+        save_books(base_dir, updated_books, backup=True)
+    except OSError as exc:
+        failures = rollback_moves(base_dir, moves)
+        message = f"Saving data.json failed: {exc}. Rolled back {len(moves)} move(s)."
+        if failures:
+            message += " Rollback failures:\n" + "\n".join(failures)
+        raise UpdateError(message) from exc
+    print(f"\n📝 Saved data.json ({len(updated_books)} books)")
+
+    remove_empty_parents(base_dir / BOOKS_DIR, [source for source, _ in moves])
+
+    print("\n📋 Updating library_structure.log...")
+    if refresh_structure_log(base_dir):
         print("  ✅ Updated library_structure.log")
-    except subprocess.CalledProcessError as e:
-        print(f"  ⚠️  Failed to update log: {e}")
+    else:
+        print("  ⚠️  Failed to update library_structure.log")
+
+    print(f"\n{'═' * 60}")
+    print(f"📊 Summary: updated {len(plan)} book(s), moved {len(moves)} file(s)")
+    print("\n📌 Next: git add -A && git commit -m 'Update books' && git push")
+    print(f"{'═' * 60}")
+    return {
+        "ok": True,
+        "dry_run": False,
+        **selection_report,
+        "updated": len(plan),
+        "files_moved": len(moves),
+        "changes": summary,
+    }
 
 
-# ══════════════════════════════════════════════════════════
-# MAIN
-# ══════════════════════════════════════════════════════════
+def select_topic_tree(books: list[dict], topic: str, category: str) -> Selection:
+    category_books = resolve_selection(books, category=category).books
+    topic_key = match_key(topic)
+    subtree = [
+        book for book in category_books
+        if match_key(book.get("topic")) == topic_key or match_key(book.get("topic")).startswith(topic_key + "/")
+    ]
+    if not subtree:
+        raise SelectionError(f'No books found in topic "{topic}" of category "{category}".')
+    matched_topics = tuple(dict.fromkeys(str(book.get("topic", "")) for book in subtree))
+    return Selection(subtree, True, matched_topics)
 
-def main() -> None:
-    """Main entry point."""
-    parser = argparse.ArgumentParser(
-        description="📚 My Bookshelves — Update books, topics, or categories"
+
+def targets_and_changes(args: argparse.Namespace, books: list[dict]) -> tuple[Selection, Changes]:
+    set_options = (args.set_description, args.set_category, args.set_topic)
+    if args.rename is not None:
+        if any(option is not None for option in set_options):
+            raise UpdateError("--rename cannot be combined with --set-description/--set-category/--set-topic.")
+        if args.book or args.book_id or not args.category:
+            raise UpdateError("--rename requires --topic+--category or --category alone.")
+        if not args.rename.strip():
+            raise UpdateError("--rename needs a non-empty name.")
+        if args.topic:
+            selection = select_topic_tree(books, args.topic, args.category)
+            return selection, Changes(topic=args.rename, replaced_topic=args.topic)
+        selection = resolve_selection(books, category=args.category)
+        return selection, Changes(category=args.rename, keep_category_prefix=True)
+
+    if all(option is None for option in set_options):
+        raise UpdateError("No update action. Use --set-description, --set-category, --set-topic, or --rename.")
+    for flag, value in (("--set-category", args.set_category), ("--set-topic", args.set_topic)):
+        if value is not None and not value.strip():
+            raise UpdateError(f"{flag} needs a non-empty name.")
+    selection = resolve_selection(
+        books,
+        book=args.book,
+        book_id=args.book_id,
+        topic=args.topic,
+        category=args.category,
+        allow_partial=args.fuzzy,
+        all_matches=args.all_matches,
     )
+    return selection, Changes(description=args.set_description, category=args.set_category, topic=args.set_topic)
 
-    # Selection
-    parser.add_argument("--book", default=None,
-                        help="Select book(s) by title (partial match)")
-    parser.add_argument("--book-id", default=None,
-                        help="Select a book by exact ID")
-    parser.add_argument("--topic", default=None,
-                        help="Select ALL books in this topic (requires --category)")
-    parser.add_argument("--category", default=None,
-                        help="Select ALL books in this category")
 
-    # Update actions
-    parser.add_argument("--set-description", default=None,
-                        help="Set new description for selected book(s)")
-    parser.add_argument("--set-category", default=None,
-                        help="Move selected book(s) to a new category")
-    parser.add_argument("--set-topic", default=None,
-                        help="Move selected book(s) to a new topic")
-    parser.add_argument("--rename", default=None,
-                        help="Rename a topic or category (use with --topic or --category)")
-
-    # Execution control
-    parser.add_argument("--execute", action="store_true",
-                        help="Actually perform updates (default: dry-run)")
-    parser.add_argument("--yes", "-y", action="store_true",
-                        help="Skip confirmation prompt")
-
-    # Utility
-    parser.add_argument("--list", action="store_true",
-                        help="List all categories, topics, and books")
-    parser.add_argument("--json", action="store_true",
-                        help="Emit a machine-readable JSON summary")
-    parser.add_argument("--base-dir", default=".",
-                        help="Project root directory (default: .)")
-
-    args = parser.parse_args()
-    base_dir = Path(args.base_dir).resolve()
-    is_dry_run = not args.execute
-
+def run_command(args: argparse.Namespace, base_dir: Path, argv: list[str]) -> dict:
     print("=" * 60)
     print("📚 My Bookshelves — Book Updater")
     print("=" * 60)
     print(f"📂 Base directory: {base_dir}")
 
-    # ── List mode ──
+    books = load_data(base_dir)
+
     if args.list:
         if args.json:
-            books = load_data(base_dir)
-            emit_json({"ok": True, "books": len(books), "tree": build_library_tree(books)})
-        else:
-            list_library(base_dir)
-        return
+            return {"ok": True, "books": len(books), "tree": build_library_tree(books)}
+        return {"ok": True, **list_library(books)}
 
-    # ── Validate ──
-    has_selection = args.book or args.book_id or args.topic or args.category
-    has_action = args.set_description or args.set_category or args.set_topic or args.rename
-
-    if not has_selection:
-        print("\n❌ No selection. Use --book, --book-id, --topic, or --category.")
-        print("   Use --list to see all available books.\n")
-        parser.print_help()
-        sys.exit(1)
-
-    if not has_action:
-        print("\n❌ No update action. Use --set-description, --set-category,")
-        print("   --set-topic, or --rename.\n")
-        parser.print_help()
-        sys.exit(1)
-
-    if args.topic and not args.category and not args.rename:
-        print("\n❌ --topic requires --category to disambiguate.")
-        sys.exit(1)
-
-    print(f"🔧 Mode: {'🚀 EXECUTE' if not is_dry_run else '👀 DRY-RUN (preview only)'}")
-
-    # ── Load data ──
-    books = load_data(base_dir)
+    print(f"🔧 Mode: {'🚀 EXECUTE' if args.execute else '👀 DRY-RUN (preview only)'}")
     print(f"\n📖 Loaded {len(books)} books from data.json")
 
-    # ── RENAME topic/category (bulk rename) ──
-    if args.rename:
-        if args.topic and args.category:
-            # Rename a topic
-            targets = find_books_by_topic(books, args.topic, args.category)
-            if not targets:
-                print(f"\n❌ No books in topic \"{args.topic}\" / category \"{args.category}\"")
-                sys.exit(1)
+    selection, changes = targets_and_changes(args, books)
+    print(f"🔍 Selected {selection.count} book(s){'' if selection.exact else ' (partial match)'}")
+    return run_update(
+        base_dir, books, selection, changes, execute=args.execute, assume_yes=args.yes, argv=argv
+    )
 
-            print(f"\n🔄 Rename topic: \"{args.topic}\" → \"{args.rename}\"")
-            print(f"   In category: \"{args.category}\"")
-            preview_book_updates(targets, "topic", args.rename)
 
-            if is_dry_run:
-                if args.json:
-                    emit_json({
-                        "ok": True,
-                        "dry_run": True,
-                        "operation": "rename_topic",
-                        "selected": len(targets),
-                        "old": args.topic,
-                        "new": args.rename,
-                        "category": args.category,
-                    })
-                    return
-                print("─" * 60)
-                print("ℹ️  DRY-RUN. No changes made. Add --execute to apply.")
-                return
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog=os.environ.get("BOOK_PROG"),
+        description="📚 My Bookshelves — Update books, topics, or categories",
+    )
 
-            if not args.yes:
-                r = input(f"\n   Rename topic for {len(targets)} book(s)? (yes/no): ").strip().lower()
-                if r not in ("yes", "y"):
-                    print("\n❌ Cancelled.")
-                    return
+    parser.add_argument("--book", default=None,
+                        help="Select a book by exact title (use --fuzzy to accept a unique partial match)")
+    parser.add_argument("--book-id", default=None, help="Select a book by exact ID")
+    parser.add_argument("--topic", default=None, help="Select ALL books in this exact topic (requires --category)")
+    parser.add_argument("--category", default=None, help="Select ALL books in this exact category")
+    parser.add_argument("--fuzzy", action="store_true",
+                        help="Let --book accept a unique partial title match")
+    parser.add_argument("--all-matches", action="store_true",
+                        help="With --fuzzy, accept a partial match that selects several different titles")
 
-            target_ids = {b["id"] for b in targets}
-            updated = apply_book_updates(books, target_ids, "topic", args.rename)
-            update_file_paths(books, target_ids, "", "", args.topic, args.rename)
-            save_data(base_dir, books)
-            print(f"\n✅ Renamed topic for {updated} book(s)")
-            print("\n📋 Updating library_structure.log...")
-            update_structure_log(base_dir)
-            if args.json:
-                emit_json({
-                    "ok": True,
-                    "dry_run": False,
-                    "operation": "rename_topic",
-                    "updated": updated,
-                })
-                return
-            print(f"\n{'═' * 60}")
-            print(f"📌 Next: git add -A && git commit -m 'Rename topic' && git push")
-            print(f"{'═' * 60}")
-            return
+    parser.add_argument("--set-description", default=None,
+                        help="Set new description for selected book(s); an empty string clears it")
+    parser.add_argument("--set-category", default=None,
+                        help="Move selected book(s) and their files to a category (existing folder is reused)")
+    parser.add_argument("--set-topic", default=None,
+                        help='Move selected book(s) and their files to a topic, e.g. "Programming Languages/Java"')
+    parser.add_argument("--rename", default=None,
+                        help="Rename a topic or category and move its files (use with --topic or --category)")
 
-        elif args.category and not args.topic:
-            # Rename a category
-            targets = find_books_by_category(books, args.category)
-            if not targets:
-                print(f"\n❌ No books in category \"{args.category}\"")
-                sys.exit(1)
+    add_mode_args(parser, execute_help="Actually perform updates (default: dry-run)")
+    parser.add_argument("--list", action="store_true", help="List all categories, topics, and books")
+    add_json_arg(parser)
+    add_base_dir_arg(parser)
+    return parser
 
-            print(f"\n🔄 Rename category: \"{args.category}\" → \"{args.rename}\"")
-            preview_book_updates(targets, "category", args.rename)
 
-            if is_dry_run:
-                if args.json:
-                    emit_json({
-                        "ok": True,
-                        "dry_run": True,
-                        "operation": "rename_category",
-                        "selected": len(targets),
-                        "old": args.category,
-                        "new": args.rename,
-                    })
-                    return
-                print("─" * 60)
-                print("ℹ️  DRY-RUN. No changes made. Add --execute to apply.")
-                return
+def main(argv: list[str] | None = None) -> int:
+    raw_args = sys.argv[1:] if argv is None else argv
+    args = build_parser().parse_args(raw_args)
+    base_dir = Path(args.base_dir).resolve()
 
-            if not args.yes:
-                r = input(f"\n   Rename category for {len(targets)} book(s)? (yes/no): ").strip().lower()
-                if r not in ("yes", "y"):
-                    print("\n❌ Cancelled.")
-                    return
-
-            target_ids = {b["id"] for b in targets}
-            updated = apply_book_updates(books, target_ids, "category", args.rename)
-            save_data(base_dir, books)
-            print(f"\n✅ Renamed category for {updated} book(s)")
-            print("\n📋 Updating library_structure.log...")
-            update_structure_log(base_dir)
-            if args.json:
-                emit_json({
-                    "ok": True,
-                    "dry_run": False,
-                    "operation": "rename_category",
-                    "updated": updated,
-                })
-                return
-            print(f"\n{'═' * 60}")
-            print(f"📌 Next: git add -A && git commit -m 'Rename category' && git push")
-            print(f"{'═' * 60}")
-            return
-
-        else:
-            print("\n❌ --rename requires --topic+--category or --category alone.")
-            sys.exit(1)
-
-    # ── BOOK-LEVEL UPDATES ──
-    targets: list[dict] = []
-
-    if args.book_id:
-        targets = find_books_by_id(books, args.book_id)
-        if not targets:
-            print(f"\n❌ No book with ID: {args.book_id}")
-            sys.exit(1)
-        print(f"🔍 Found {len(targets)} book(s) with ID: {args.book_id}")
-
-    elif args.book:
-        targets = find_books_by_title(books, args.book)
-        if not targets:
-            print(f"\n❌ No book matching: \"{args.book}\"")
-            sys.exit(1)
-        print(f"🔍 Found {len(targets)} book(s) matching: \"{args.book}\"")
-
-    elif args.topic and args.category:
-        targets = find_books_by_topic(books, args.topic, args.category)
-        if not targets:
-            print(f"\n❌ No books in topic \"{args.topic}\" / \"{args.category}\"")
-            sys.exit(1)
-        print(f"🔍 Found {len(targets)} book(s) in topic \"{args.topic}\"")
-
-    elif args.category:
-        targets = find_books_by_category(books, args.category)
-        if not targets:
-            print(f"\n❌ No books in category: \"{args.category}\"")
-            sys.exit(1)
-        print(f"🔍 Found {len(targets)} book(s) in category \"{args.category}\"")
-
-    # Collect all updates to apply
-    updates: list[tuple[str, str]] = []
-    if args.set_description is not None:
-        updates.append(("description", args.set_description))
-    if args.set_category is not None:
-        updates.append(("category", args.set_category))
-    if args.set_topic is not None:
-        updates.append(("topic", args.set_topic))
-
-    # Preview
-    for field, value in updates:
-        preview_book_updates(targets, field, value)
-
-    if is_dry_run:
-        if args.json:
-            emit_json({
-                "ok": True,
-                "dry_run": True,
-                "selected": len(targets),
-                "updates": [{"field": field, "value": value} for field, value in updates],
-                "books": targets,
-            })
-            return
-        print("─" * 60)
-        print("ℹ️  DRY-RUN. No changes made. Add --execute to apply.")
-        return
-
-    # Confirm
-    if not args.yes:
-        fields_str = ", ".join(f for f, _ in updates)
-        r = input(f"\n   Update {fields_str} for {len(targets)} book(s)? (yes/no): ").strip().lower()
-        if r not in ("yes", "y"):
-            print("\n❌ Cancelled.")
-            return
-
-    # Apply
-    print(f"\n{'─' * 60}")
-    print("🚀 Applying updates...\n")
-
-    target_ids = {b["id"] for b in targets}
-    total_updated = 0
-
-    for field, value in updates:
-        count = apply_book_updates(books, target_ids, field, value)
-        print(f"  ✅ Updated {field} for {count} book(s)")
-        total_updated += count
-
-    # Update file_path if category or topic changed
-    if args.set_category or args.set_topic:
-        old_cat = targets[0].get("category", "") if not args.set_category else args.category or ""
-        new_cat = args.set_category or ""
-        old_topic = args.topic or ""
-        new_topic = args.set_topic or ""
-        if new_cat or new_topic:
-            paths = update_file_paths(books, target_ids, old_cat, new_cat, old_topic, new_topic)
-            if paths:
-                print(f"  ✅ Updated {paths} file path(s)")
-
-    save_data(base_dir, books)
-    print(f"\n📝 Saved data.json ({len(books)} books)")
-
-    print("\n📋 Updating library_structure.log...")
-    update_structure_log(base_dir)
+    with json_mode(args.json):
+        try:
+            result = run_command(args, base_dir, raw_args)
+        except (UpdateError, SelectionError, ValueError, OSError) as exc:
+            print(f"\n❌ {exc}")
+            result = {"ok": False, "error": str(exc)}
 
     if args.json:
-        emit_json({
-            "ok": True,
-            "dry_run": False,
-            "selected": len(targets),
-            "fields_updated": total_updated,
-            "books_total": len(books),
-        })
-        return
-
-    print(f"\n{'═' * 60}")
-    print(f"📊 Summary: Updated {total_updated} field(s) across {len(targets)} book(s)")
-    print(f"\n📌 Next: git add -A && git commit -m 'Update books' && git push")
-    print(f"{'═' * 60}")
+        emit_json(result)
+    return EXIT_OK if result.get("ok") else EXIT_FAILURE
 
 
 if __name__ == "__main__":
-    main()
+    run_main(main)

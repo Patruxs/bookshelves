@@ -1,5 +1,4 @@
 #!/usr/bin/env sh
-# Short launcher for the My Bookshelves CLI.
 
 set -eu
 
@@ -16,18 +15,26 @@ done
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$SOURCE")" && pwd)
 UNAME=$(uname -s 2>/dev/null || printf unknown)
 
+IS_WINDOWS=false
+if [ "${OS:-}" = "Windows_NT" ] || echo "$UNAME" | grep -Eq '^(MINGW|MSYS|CYGWIN)'; then
+    IS_WINDOWS=true
+fi
+
 if [ -x "$ROOT_DIR/venv/bin/python" ]; then
     PYTHON_CMD="$ROOT_DIR/venv/bin/python"
-elif [ -x "$ROOT_DIR/venv/Scripts/python.exe" ] && \
-    { [ "${OS:-}" = "Windows_NT" ] || echo "$UNAME" | grep -Eq '^(MINGW|MSYS|CYGWIN)'; }; then
+elif [ "$IS_WINDOWS" = true ] && [ -x "$ROOT_DIR/venv/Scripts/python.exe" ]; then
     PYTHON_CMD="$ROOT_DIR/venv/Scripts/python.exe"
-elif [ -x "$ROOT_DIR/venv/Scripts/python" ] && \
-    { [ "${OS:-}" = "Windows_NT" ] || echo "$UNAME" | grep -Eq '^(MINGW|MSYS|CYGWIN)'; }; then
+elif [ "$IS_WINDOWS" = true ] && [ -x "$ROOT_DIR/venv/Scripts/python" ]; then
     PYTHON_CMD="$ROOT_DIR/venv/Scripts/python"
-elif command -v python3 >/dev/null 2>&1; then
-    PYTHON_CMD="python3"
 else
-    PYTHON_CMD="python"
+    if [ "$IS_WINDOWS" = false ] && [ -d "$ROOT_DIR/venv" ]; then
+        echo "venv/ was built for another OS; run ./setup.sh" >&2
+    fi
+    if command -v python3 >/dev/null 2>&1; then
+        PYTHON_CMD="python3"
+    else
+        PYTHON_CMD="python"
+    fi
 fi
 
 cd "$ROOT_DIR"

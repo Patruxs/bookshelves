@@ -1,425 +1,417 @@
 #!/usr/bin/env python3
-"""
-📚 My Bookshelves — Data Generator (Agent 2: Python/Data Engineer)
+from __future__ import annotations
 
-Scans the book directory structure, extracts cover images from PDF/EPUB/DOCX files,
-and generates a data.json file for the frontend.
-
-Usage:
-    cd scripts/
-    python generate_data.py [--base-dir ..] [--force]
-"""
-
-import os
-import sys
-import json
-import re
 import argparse
-import hashlib
+import json
+import sys
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field
 from pathlib import Path
 
-from lib.covers import extract_cover as extract_shared_cover
+from generate_structure_log import LOG_FILENAME, render_log, write_log_if_changed
+from lib.book_paths import cover_filename, detect_cover_collisions, generate_book_id, normalize_text
+from lib.cli_common import EXIT_FAILURE, EXIT_OK, add_base_dir_arg, add_json_arg, json_mode, run_main
+from lib.constants import BOOKS_DIR, COVER_DIR, DATA_JSON
+from lib.covers import dependency_status, extract_cover_with_reason
 from lib.json_io import load_json, write_json_atomic
 from lib.output import emit_json
+from lib.scanner import scan_library
 
-# Fix Windows console encoding for Unicode status output.
-if sys.stdout.encoding != 'utf-8':
-    sys.stdout.reconfigure(encoding='utf-8')
-if sys.stderr.encoding != 'utf-8':
-    sys.stderr.reconfigure(encoding='utf-8')
-
-# ── Optional imports (graceful fallback) ──
-try:
-    import fitz  # PyMuPDF
-    HAS_PYMUPDF = True
-except ImportError:
-    HAS_PYMUPDF = False
-    print("⚠️  PyMuPDF not installed. PDF cover extraction disabled.")
-    print("   Install with: pip install PyMuPDF")
-
-try:
-    from PIL import Image
-    HAS_PILLOW = True
-except ImportError:
-    HAS_PILLOW = False
-
-# Note: ebooklib no longer needed for cover extraction.
-# PyMuPDF (fitz) handles both PDF and EPUB page rendering.
-
-try:
-    from docx import Document as DocxDocument
-    HAS_PYTHON_DOCX = True
-except ImportError:
-    HAS_PYTHON_DOCX = False
-    print("⚠️  python-docx not installed. DOCX cover extraction disabled.")
-    print("   Install with: pip install python-docx")
+Reporter = Callable[[str], None]
+MERGED_FIELDS = ("description", "download_url")
 
 
-# ── Configuration ──
-BOOK_EXTENSIONS = {'.pdf', '.epub', '.docx'}
-COVER_DIR = 'site/assets/covers'       # Filesystem path (relative to base_dir)
-COVER_WEB_PATH = 'assets/covers'       # Web URL path (relative to site/ root)
-OUTPUT_FILE = 'site/data.json'
-BOOKS_DIR = 'Books'                    # Folder containing category subfolders
-COVER_WIDTH = 600       # Max width for cover thumbnails (sharp on High-DPI/Retina)
-COVER_QUALITY = 85      # WebP quality (target: <80KB per image)
-COVER_FORMAT = 'webp'   # Output format (webp for maximum compression)
-
-# Category folders expected at root level
-CATEGORY_PATTERN = re.compile(r'^(\d+)_(.+)$')
+class GenerateAborted(Exception):
+    pass
 
 
-def sanitize_filename(name: str) -> str:
-    """Create a safe filename from a book title."""
-    name = re.sub(r'[^\w\s\-.]', '', name)
-    name = re.sub(r'\s+', '_', name.strip())
-    return name[:100]  # Limit length
+@dataclass
+class MergeResult:
+    books: list[dict] = field(default_factory=list)
+    kept_stale: list[dict] = field(default_factory=list)
+    dropped_stale: list[dict] = field(default_factory=list)
+    moved: list[tuple[str, str]] = field(default_factory=list)
+    added: list[dict] = field(default_factory=list)
 
 
-def parse_category_name(folder_name: str) -> str:
-    """Convert folder name like '1_Computer_Science_Fundamentals' to readable name."""
-    match = CATEGORY_PATTERN.match(folder_name)
-    if match:
-        return match.group(2).replace('_', ' ')
-    return folder_name.replace('_', ' ')
+@dataclass
+class CoverStats:
+    extracted: int = 0
+    refreshed: int = 0
+    skipped: int = 0
+    failed: int = 0
 
 
-def parse_topic_name(folder_name: str) -> str:
-    """Convert folder name like 'Data_Structures_and_Algorithms' to readable name."""
-    return folder_name.replace('_', ' ')
+@dataclass
+class DedupeResult:
+    entries: list[dict] = field(default_factory=list)
+    duplicates: list[str] = field(default_factory=list)
 
 
-def extract_pdf_cover(pdf_path: str, output_path: str) -> bool:
-    """Extract first page of PDF as cover image (WebP, optimized)."""
-    if not HAS_PYMUPDF:
-        return False
-    try:
-        doc = fitz.open(pdf_path)
-        if doc.page_count == 0:
-            doc.close()
-            return False
-
-        page = doc[0]
-        # Render at 3x for quality before downscale (sharp on Retina)
-        zoom = 3.0
-        mat = fitz.Matrix(zoom, zoom)
-        pix = page.get_pixmap(matrix=mat, alpha=False)
-
-        if HAS_PILLOW:
-            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            # Resize to max COVER_WIDTH
-            if img.width > COVER_WIDTH:
-                ratio = COVER_WIDTH / img.width
-                new_height = int(img.height * ratio)
-                img = img.resize((COVER_WIDTH, new_height), Image.LANCZOS)
-            img.save(output_path, 'WEBP', quality=COVER_QUALITY, method=6)
-        else:
-            pix.save(output_path)
-
-        doc.close()
-        return True
-    except Exception as e:
-        print(f"  ❌ Error extracting PDF cover: {e}")
-        return False
+def warn(message: str) -> None:
+    print(f"⚠️  {message}", file=sys.stderr)
 
 
-def extract_epub_cover(epub_path: str, output_path: str) -> bool:
-    """Extract first page of EPUB as cover image using PyMuPDF (WebP, optimized).
-
-    PyMuPDF can open and render EPUB pages directly, producing reliable
-    covers from the actual first page rather than searching embedded images
-    which may pick up diagrams or icons instead of the real cover.
-    """
-    if not HAS_PYMUPDF:
-        return False
-    try:
-        doc = fitz.open(epub_path)
-        if doc.page_count == 0:
-            doc.close()
-            return False
-
-        page = doc[0]
-        # Render at 3x for quality before downscale (sharp on Retina)
-        zoom = 3.0
-        mat = fitz.Matrix(zoom, zoom)
-        pix = page.get_pixmap(matrix=mat, alpha=False)
-
-        if HAS_PILLOW:
-            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            # Resize to max COVER_WIDTH
-            if img.width > COVER_WIDTH:
-                ratio = COVER_WIDTH / img.width
-                new_height = int(img.height * ratio)
-                img = img.resize((COVER_WIDTH, new_height), Image.LANCZOS)
-            img.save(output_path, 'WEBP', quality=COVER_QUALITY, method=6)
-        else:
-            pix.save(output_path)
-
-        doc.close()
-        return True
-    except Exception as e:
-        print(f"  ❌ Error extracting EPUB cover: {e}")
-        return False
+def load_existing_books(output_path: Path) -> list[dict]:
+    data = load_json(output_path, default=[])
+    if not isinstance(data, list):
+        raise ValueError(f"{output_path} must contain a JSON array, got {type(data).__name__}")
+    for index, entry in enumerate(data):
+        if not isinstance(entry, dict):
+            raise ValueError(f"{output_path} entry {index} is not an object")
+    return data
 
 
-def extract_docx_cover(docx_path: str, output_path: str) -> bool:
-    """Extract first embedded image from DOCX as cover image (WebP, optimized).
-
-    DOCX files cannot be page-rendered like PDF/EPUB. Instead, we look for
-    the first embedded image (typically a cover or header image) and use that.
-    """
-    if not HAS_PYTHON_DOCX or not HAS_PILLOW:
-        return False
-    try:
-        from io import BytesIO
-
-        doc = DocxDocument(docx_path)
-        # Iterate through all relationships to find images
-        for rel in doc.part.rels.values():
-            if "image" in rel.reltype:
-                image_data = rel.target_part.blob
-                img = Image.open(BytesIO(image_data))
-                if img.mode in ("RGBA", "P"):
-                    img = img.convert("RGB")
-                # Resize to max COVER_WIDTH
-                if img.width > COVER_WIDTH:
-                    ratio = COVER_WIDTH / img.width
-                    new_height = int(img.height * ratio)
-                    img = img.resize((COVER_WIDTH, new_height), Image.LANCZOS)
-                img.save(output_path, 'WEBP', quality=COVER_QUALITY, method=6)
-                return True
-
-        return False
-    except Exception as e:
-        print(f"  ❌ Error extracting DOCX cover: {e}")
-        return False
+def title_format_key(title: object, book_format: object) -> tuple[str, str]:
+    return normalize_text(str(title or "")), str(book_format or "").lower()
 
 
-def generate_book_id(file_path: str) -> str:
-    """Generate a unique ID from file path."""
-    return hashlib.md5(file_path.encode('utf-8')).hexdigest()[:12]
+def path_derived_fields(scanned_book: dict) -> dict[str, object]:
+    return {
+        "id": generate_book_id(scanned_book["rel_path"]),
+        "title": scanned_book["title"],
+        "category": scanned_book["category"],
+        "topic": scanned_book["topic"],
+        "file_path": scanned_book["rel_path"],
+        "format": scanned_book["format"],
+    }
 
 
-def scan_books(base_dir: str, force_covers: bool = False) -> list:
-    """
-    Scan the book directory structure and extract metadata + covers.
+def new_entry(scanned_book: dict) -> dict:
+    fields = path_derived_fields(scanned_book)
+    return {
+        "id": fields["id"],
+        "title": fields["title"],
+        "category": fields["category"],
+        "topic": fields["topic"],
+        "file_path": fields["file_path"],
+        "cover": "",
+        "format": fields["format"],
+        "description": "",
+    }
 
-    Expected structure:
-      base_dir/
-        1_Category_Name/
-          Topic_Name/
-            Book Title.pdf
-          SubTopic/
-            Book Title.epub
-    """
-    base = Path(base_dir).resolve()
-    covers_dir = base / COVER_DIR
-    covers_dir.mkdir(parents=True, exist_ok=True)
 
-    books = []
-    skipped = 0
-    extracted = 0
-    failed = 0
-    pdf_covered_stems = set()  # Track covers already generated from PDF
+def group_by_title_format(items: Iterable[dict]) -> dict[tuple[str, str], list[dict]]:
+    groups: dict[tuple[str, str], list[dict]] = {}
+    for item in items:
+        groups.setdefault(title_format_key(item.get("title"), item.get("format")), []).append(item)
+    return groups
 
-    print(f"\n📂 Scanning: {base}")
-    print(f"📁 Covers directory: {covers_dir}\n")
 
-    # Books are inside the Books/ subdirectory
-    books_root = base / BOOKS_DIR
-    if not books_root.exists():
-        print(f"⚠️  Books directory not found: {books_root}")
-        return books
-
-    # Iterate category folders
-    for cat_folder in sorted(books_root.iterdir()):
-        if not cat_folder.is_dir():
+def dedupe_by_file_path(existing: list[dict]) -> DedupeResult:
+    result = DedupeResult()
+    kept_by_path: dict[str, dict] = {}
+    for entry in existing:
+        file_path = entry.get("file_path")
+        if not isinstance(file_path, str) or not file_path:
+            result.entries.append(entry)
             continue
-        if not CATEGORY_PATTERN.match(cat_folder.name):
+        kept = kept_by_path.get(file_path)
+        if kept is None:
+            kept_by_path[file_path] = entry
+            result.entries.append(entry)
             continue
-
-        category_name = parse_category_name(cat_folder.name)
-        print(f"📚 Category: {category_name}")
-
-        # Walk through all subdirectories
-        for root, dirs, files in os.walk(cat_folder):
-            root_path = Path(root)
-            # Determine topic from relative path
-            rel_to_cat = root_path.relative_to(cat_folder)
-            parts = rel_to_cat.parts
-
-            if len(parts) == 0:
-                # Files directly in category folder
-                topic_name = category_name
-            elif len(parts) == 1:
-                # Single-level topic (e.g. Data_Structures_and_Algorithms)
-                topic_name = parse_topic_name(parts[0])
-            else:
-                # Nested sub-topic (e.g. Programming_Languages/Java)
-                # Join ALL parts with '/' to preserve hierarchy
-                topic_name = '/'.join(parse_topic_name(p) for p in parts)
-
-            # Sort: PDF before EPUB for same stem (PDF cover takes priority)
-            def _sort_pdf_first(name: str) -> tuple:
-                p = Path(name)
-                ext_priority = {'.pdf': 0, '.epub': 1, '.docx': 2}
-                ext_order = ext_priority.get(p.suffix.lower(), 3)
-                return (p.stem, ext_order)
-
-            for filename in sorted(files, key=_sort_pdf_first):
-                file_path = root_path / filename
-                ext = file_path.suffix.lower()
-
-                if ext not in BOOK_EXTENSIONS:
-                    continue
-
-                # Extract book title from filename
-                title = file_path.stem
-
-                # Relative path for frontend
-                rel_path = file_path.relative_to(base).as_posix()
-
-                # Cover filename (.webp for optimization)
-                cover_filename = sanitize_filename(title) + '.webp'
-                cover_path = covers_dir / cover_filename
-                cover_rel = f"{COVER_WEB_PATH}/{cover_filename}"
-
-                # Stale JPG cleanup is intentionally left to optimize_covers.py
-                # so generate runs do not delete files as a side effect.
-
-                # Extract cover (skip if exists and not forced)
-                # PDF covers take priority — if PDF already created this cover,
-                # EPUB should not overwrite it (even with --force).
-                cover_stem = sanitize_filename(title)
-                has_cover = False
-
-                if ext == '.epub' and cover_stem in pdf_covered_stems:
-                    # PDF already generated this cover — skip EPUB
-                    has_cover = cover_path.exists()
-                    if has_cover:
-                        skipped += 1
-                        print(f"  ⏭️  Skip cover (PDF priority): {title}")
-                elif cover_path.exists() and not force_covers:
-                    has_cover = True
-                    skipped += 1
-                    print(f"  ⏭️  Skip cover (exists): {title}")
-                else:
-                    print(f"  🖼️  Extracting cover: {title}...", end=' ')
-                    if ext == '.pdf':
-                        has_cover = extract_shared_cover(file_path, cover_path)
-                        if has_cover:
-                            pdf_covered_stems.add(cover_stem)
-                    elif ext == '.epub':
-                        has_cover = extract_shared_cover(file_path, cover_path)
-                    elif ext == '.docx':
-                        has_cover = extract_shared_cover(file_path, cover_path)
-
-                    if has_cover:
-                        extracted += 1
-                        print("✅")
-                    else:
-                        failed += 1
-                        print("❌")
-
-                # Build book entry
-                book = {
-                    'id': generate_book_id(rel_path),
-                    'title': title,
-                    'category': category_name,
-                    'topic': topic_name,
-                    'file_path': rel_path,
-                    'cover': cover_rel if has_cover else '',
-                    'format': ext[1:],  # 'pdf' or 'epub'
-                    'description': '',
-                }
-                books.append(book)
-
-    print(f"\n{'='*50}")
-    print(f"📊 Summary:")
-    print(f"   Total books found: {len(books)}")
-    print(f"   Covers extracted:  {extracted}")
-    print(f"   Covers skipped:    {skipped}")
-    print(f"   Covers failed:     {failed}")
-    print(f"{'='*50}\n")
-
-    return books
+        for field_name in MERGED_FIELDS:
+            if not kept.get(field_name) and entry.get(field_name):
+                kept[field_name] = entry[field_name]
+        result.duplicates.append(file_path)
+    return result
 
 
-def main():
-    parser = argparse.ArgumentParser(description='Generate data.json and cover images for My Bookshelves')
-    parser.add_argument('--base-dir', default='..', help='Base directory of the book library (default: parent directory)')
-    parser.add_argument('--force', action='store_true', help='Force regenerate all cover images')
-    parser.add_argument('--keep-stale', action='store_true',
-                        help='Keep existing data.json entries whose files were not scanned')
-    parser.add_argument('--json', action='store_true', help='Emit a machine-readable JSON summary')
-    parser.add_argument('--output', default=OUTPUT_FILE, help=f'Output JSON file (default: {OUTPUT_FILE})')
-    args = parser.parse_args()
+def merge_entries(scanned_books: list[dict], existing: list[dict], *, prune: bool) -> MergeResult:
+    existing_by_path = {
+        entry["file_path"]: entry
+        for entry in existing
+        if isinstance(entry.get("file_path"), str) and entry.get("file_path")
+    }
+    scanned_by_path = {book["rel_path"]: book for book in scanned_books}
 
-    books = scan_books(args.base_dir, force_covers=args.force)
+    stale = [entry for entry in existing if entry.get("file_path") not in scanned_by_path]
+    unmatched = [book for book in scanned_books if book["rel_path"] not in existing_by_path]
 
-    # Load existing data.json to preserve descriptions and download_url
-    output_path = Path(args.base_dir) / args.output
-    existing_descriptions = {}
-    existing_download_urls = {}
-    existing_by_title = {}
-    existing_urls_by_title = {}
-    existing = []
-    if output_path.exists():
-        try:
-            existing = load_json(output_path, default=[]) or []
-            for entry in existing:
-                desc = entry.get('description', '')
-                url = entry.get('download_url', '')
-                if entry.get('file_path'):
-                    if desc:
-                        existing_descriptions[entry['file_path']] = desc
-                    if url:
-                        existing_download_urls[entry['file_path']] = url
-                if entry.get('title'):
-                    if desc:
-                        existing_by_title[entry['title']] = desc
-                    if url:
-                        existing_urls_by_title[entry['title']] = url
-        except (json.JSONDecodeError, KeyError, ValueError) as exc:
-            print(f"⚠️  Could not preserve existing metadata: {exc}")
+    stale_by_key = group_by_title_format(stale)
+    moved_to: dict[int, dict] = {}
+    for key, books in group_by_title_format(unmatched).items():
+        candidates = stale_by_key.get(key, [])
+        if len(books) == 1 and len(candidates) == 1:
+            moved_to[id(candidates[0])] = books[0]
 
-    # Merge: keep existing descriptions and download_urls (match by file_path first, then title)
-    scanned_paths = {book['file_path'] for book in books}
+    result = MergeResult()
+    for entry in existing:
+        scanned = scanned_by_path.get(entry.get("file_path"))
+        if scanned is None and id(entry) in moved_to:
+            scanned = moved_to[id(entry)]
+            result.moved.append((str(entry.get("file_path")), scanned["rel_path"]))
+        if scanned is not None:
+            entry.update(path_derived_fields(scanned))
+            result.books.append(entry)
+        elif entry.get("download_url") and not prune:
+            result.kept_stale.append(entry)
+            result.books.append(entry)
+        else:
+            result.dropped_stale.append(entry)
+
+    moved_paths = {new_path for _old_path, new_path in result.moved}
+    for book in sorted(unmatched, key=lambda scanned: scanned["rel_path"]):
+        if book["rel_path"] in moved_paths:
+            continue
+        entry = new_entry(book)
+        result.added.append(entry)
+        result.books.append(entry)
+    return result
+
+
+def cover_is_outdated(book_path: Path, cover_path: Path) -> bool:
+    try:
+        return book_path.stat().st_mtime > cover_path.stat().st_mtime
+    except OSError:
+        return False
+
+
+def assign_covers(
+    base_dir: Path,
+    books: list[dict],
+    *,
+    force: bool,
+    dry_run: bool,
+    report: Reporter,
+) -> CoverStats:
+    covers_dir = base_dir / COVER_DIR
+    stats = CoverStats()
+    covered_this_run: set[str] = set()
+
     for book in books:
-        if book['file_path'] in existing_descriptions:
-            book['description'] = existing_descriptions[book['file_path']]
-        elif book['title'] in existing_by_title:
-            book['description'] = existing_by_title[book['title']]
-        if book['file_path'] in existing_download_urls:
-            book['download_url'] = existing_download_urls[book['file_path']]
-        elif book['title'] in existing_urls_by_title:
-            book['download_url'] = existing_urls_by_title[book['title']]
+        title = str(book["title"])
+        cover_name = cover_filename(title)
+        cover_path = covers_dir / cover_name
+        book_path = base_dir / str(book["file_path"])
 
-    stale_entries = [
-        entry for entry in existing
-        if entry.get('file_path') and entry.get('file_path') not in scanned_paths
-    ]
-    final_books = books + stale_entries if args.keep_stale else books
-    backup_path = write_json_atomic(output_path, final_books, backup=True)
+        if not book_path.is_file():
+            stats.skipped += 1
+            continue
+        if cover_name in covered_this_run:
+            book["cover"] = f"{COVER_DIR}/{cover_name}"
+            stats.skipped += 1
+            continue
 
-    summary = {
-        "ok": True,
+        outdated = cover_path.exists() and cover_is_outdated(book_path, cover_path)
+        if cover_path.exists() and not force and not outdated:
+            has_cover = True
+            stats.skipped += 1
+        elif dry_run:
+            has_cover = cover_path.exists()
+            report(f"  🖼️  Would {'refresh' if cover_path.exists() else 'extract'} cover: {title}")
+        else:
+            has_cover = extract_book_cover(book_path, cover_path, title, stats, report, refresh=outdated)
+
+        if has_cover:
+            covered_this_run.add(cover_name)
+        book["cover"] = f"{COVER_DIR}/{cover_name}" if has_cover else ""
+    return stats
+
+
+def extract_book_cover(
+    book_path: Path,
+    cover_path: Path,
+    title: str,
+    stats: CoverStats,
+    report: Reporter,
+    *,
+    refresh: bool,
+) -> bool:
+    had_cover = cover_path.exists()
+    try:
+        extracted, reason = extract_cover_with_reason(book_path, cover_path)
+    except Exception as exc:
+        extracted, reason = False, f"{type(exc).__name__}: {exc}"
+    if extracted:
+        if refresh:
+            stats.refreshed += 1
+            report(f"  🖼️  Refreshed cover (book changed): {title}")
+        else:
+            stats.extracted += 1
+            report(f"  🖼️  Extracted cover: {title}")
+        return True
+    stats.failed += 1
+    warn(f"Cover failed for {title}: {reason}")
+    return had_cover
+
+
+def find_orphan_covers(base_dir: Path, books: list[dict]) -> list[Path]:
+    covers_dir = base_dir / COVER_DIR
+    if not covers_dir.is_dir():
+        return []
+    referenced = {Path(str(book.get("cover") or "")).name for book in books}
+    return sorted(
+        path for path in covers_dir.iterdir()
+        if path.is_file() and not path.name.startswith(".") and path.name not in referenced
+    )
+
+
+def serialize_books(books: list[dict]) -> str:
+    return json.dumps(books, ensure_ascii=False, indent=2) + "\n"
+
+
+def read_text_or_none(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Generate data.json and cover images for My Bookshelves")
+    add_base_dir_arg(parser)
+    add_json_arg(parser)
+    parser.add_argument("--force", action="store_true", help="Force regenerate all cover images")
+    parser.add_argument("--prune", action="store_true",
+                        help="Also drop entries whose files are missing even if they have a download_url")
+    parser.add_argument("--prune-covers", action="store_true",
+                        help="Delete cover images that no data.json entry references")
+    parser.add_argument("--dry-run", action="store_true", help="Show the result without writing covers or data")
+    parser.add_argument("--quiet", action="store_true", help="Only print warnings and the summary")
+    parser.add_argument("--output", default=DATA_JSON, help=f"Output JSON file (default: {DATA_JSON})")
+    return parser
+
+
+def generate(args: argparse.Namespace) -> dict:
+    base_dir = args.base_dir.resolve()
+    output_path = base_dir / args.output
+
+    def report(message: str) -> None:
+        if not args.quiet:
+            print(message)
+
+    try:
+        existing = load_existing_books(output_path)
+    except (OSError, ValueError) as exc:
+        raise GenerateAborted(f"Cannot read {output_path}; refusing to overwrite it: {exc}") from exc
+
+    report(f"📂 Scanning: {base_dir}")
+    scan = scan_library(base_dir)
+    for skipped in scan.skipped:
+        warn(f"Skipped {skipped.path}: {skipped.reason}")
+
+    if not scan.books and existing:
+        raise GenerateAborted(
+            f"Found 0 books under {base_dir / BOOKS_DIR} but {output_path} has {len(existing)} entries; "
+            "refusing to write. Check --base-dir or restore Books/."
+        )
+
+    dedupe = dedupe_by_file_path(existing)
+    for file_path in dedupe.duplicates:
+        warn(f"Duplicate entry for {file_path}; merged description/download_url into the first one")
+
+    merge = merge_entries(scan.books, dedupe.entries, prune=args.prune)
+    for old_path, new_path in merge.moved:
+        warn(f"moved: {old_path} -> {new_path} (description and download_url carried over)")
+    for entry in merge.kept_stale:
+        warn(f"Kept entry with download_url whose file is missing: {entry.get('file_path')}")
+    for entry in merge.dropped_stale:
+        warn(f"Dropped stale entry: {entry.get('file_path')}")
+    for entry in merge.added:
+        report(f"  ➕ New book: {entry['file_path']}")
+    for cover, titles in detect_cover_collisions(merge.books).items():
+        warn(f"Cover collision on {cover}: {', '.join(titles)}")
+
+    if not args.dry_run:
+        for name, available in dependency_status().items():
+            if not available:
+                warn(f"{name} is not installed; covers that need it cannot be extracted")
+
+    cover_stats = assign_covers(base_dir, merge.books, force=args.force, dry_run=args.dry_run, report=report)
+
+    orphan_covers = find_orphan_covers(base_dir, merge.books)
+    pruned_covers: list[Path] = []
+    if args.prune_covers and not args.dry_run:
+        for orphan in orphan_covers:
+            orphan.unlink(missing_ok=True)
+            pruned_covers.append(orphan)
+            report(f"  🗑️  Deleted orphan cover: {orphan.name}")
+    elif orphan_covers:
+        hint = "dry run" if args.prune_covers else "delete with --prune-covers"
+        warn(f"{len(orphan_covers)} orphan covers not referenced by any book ({hint})")
+
+    changed = read_text_or_none(output_path) != serialize_books(merge.books)
+    backup_path = None
+    structure_log_changed = False
+    if not args.dry_run:
+        if changed:
+            backup_path = write_json_atomic(output_path, merge.books, backup=True)
+        structure_log_changed = write_log_if_changed(render_log(merge.books), base_dir / LOG_FILENAME)
+
+    ok = cover_stats.failed == 0 and not scan.skipped
+    return {
+        "ok": ok,
+        "dry_run": args.dry_run,
+        "changed": changed,
         "output": output_path,
-        "books_scanned": len(books),
-        "books_written": len(final_books),
-        "stale_removed": 0 if args.keep_stale else len(stale_entries),
-        "stale_kept": len(stale_entries) if args.keep_stale else 0,
+        "books_scanned": len(scan.books),
+        "books_written": len(merge.books),
+        "added": len(merge.added),
+        "moved": [{"from": old_path, "to": new_path} for old_path, new_path in merge.moved],
+        "duplicates": len(dedupe.duplicates),
+        "stale_kept": len(merge.kept_stale),
+        "stale_removed": len(merge.dropped_stale),
+        "skipped_files": [{"path": skipped.path, "reason": skipped.reason} for skipped in scan.skipped],
+        "covers": {
+            "extracted": cover_stats.extracted,
+            "refreshed": cover_stats.refreshed,
+            "skipped": cover_stats.skipped,
+            "failed": cover_stats.failed,
+        },
+        "orphan_covers": [orphan.relative_to(base_dir).as_posix() for orphan in orphan_covers],
+        "orphan_covers_deleted": len(pruned_covers),
+        "structure_log_changed": structure_log_changed,
         "backup": backup_path,
     }
+
+
+def print_summary(summary: dict) -> None:
+    covers = summary["covers"]
+    print(f"\n{'=' * 50}")
+    print("📊 Summary:")
+    print(f"   Total books found: {summary['books_scanned']}")
+    print(f"   New entries:       {summary['added']}")
+    print(f"   Covers extracted:  {covers['extracted']}")
+    print(f"   Covers refreshed:  {covers['refreshed']}")
+    print(f"   Covers failed:     {covers['failed']}")
+    print(f"   Moved entries:     {len(summary['moved'])}")
+    print(f"   Duplicates merged: {summary['duplicates']}")
+    print(f"   Stale kept:        {summary['stale_kept']}")
+    print(f"   Stale removed:     {summary['stale_removed']}")
+    print(f"   Skipped files:     {len(summary['skipped_files'])}")
+    print(f"   Orphan covers:     {len(summary['orphan_covers'])}")
+    print(f"{'=' * 50}")
+    output_path = summary["output"]
+    books_written = summary["books_written"]
+    if summary["dry_run"]:
+        verb = "would write" if summary["changed"] else "would leave unchanged"
+        print(f"🔍 DRY RUN — {verb} {output_path} ({books_written} books).")
+    elif summary["changed"]:
+        print(f"✅ Wrote {output_path} with {books_written} books.")
+        if summary["backup"]:
+            print(f"💾 Backup: {summary['backup']}")
+    else:
+        print(f"✅ {output_path} is up to date ({books_written} books).")
+    if not summary["ok"]:
+        print("❌ Some covers failed or files were skipped; see warnings above.", file=sys.stderr)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    with json_mode(args.json):
+        try:
+            summary = generate(args)
+        except GenerateAborted as exc:
+            print(f"❌ {exc}", file=sys.stderr)
+            summary = {"ok": False, "error": str(exc)}
+        else:
+            print_summary(summary)
     if args.json:
         emit_json(summary)
-    else:
-        print(f"✅ Generated {output_path} with {len(final_books)} books.")
-        if stale_entries and not args.keep_stale:
-            print(f"🧹 Removed {len(stale_entries)} stale data.json entrie(s).")
-        if backup_path:
-            print(f"💾 Backup: {backup_path}")
+    return EXIT_OK if summary["ok"] else EXIT_FAILURE
 
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    run_main(main)

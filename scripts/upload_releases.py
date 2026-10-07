@@ -1,571 +1,434 @@
 #!/usr/bin/env python3
-"""
-📚 My Bookshelves — Smart Incremental Sync (Agent 4: DevOps)
+from __future__ import annotations
 
-Smart Incremental Sync: upload ONLY NEW books to GitHub Releases,
-without re-uploading the entire library. Uses data.json as the single source of truth.
-
-Workflow:
-  1. Scan Books/ for all PDF/EPUB/DOCX files
-  2. Read data.json → filter files that already have download_url (already uploaded)
-  3. Diff → list NEW files that need upload
-  4. Create WebP covers for new files (if missing)
-  5. Upload ONLY new files to the fixed release (storage-v1)
-  6. Append metadata to data.json + update download_url
-  7. Commit data.json + covers → done
-
-Usage:
-    python scripts/upload_releases.py                     # Sync new files
-    python scripts/upload_releases.py --tag storage-v1    # Custom tag
-    python scripts/upload_releases.py --dry-run            # Preview
-    python scripts/upload_releases.py --force              # Re-upload everything
-
-Requirements:
-    - GitHub CLI (gh) installed & authenticated
-    - PyMuPDF (fitz), Pillow, python-docx
-"""
-
-import os
-import sys
-import json
-import hashlib
-import subprocess
 import argparse
+import json
 import re
+import subprocess
+import sys
+from dataclasses import dataclass, field
 from pathlib import Path
-from datetime import datetime
-from typing import Optional
 
-from lib.book_paths import format_size as shared_fmt_size
-from lib.book_paths import generate_book_id as shared_generate_book_id
-from lib.book_paths import sanitize_filename as shared_sanitize_filename
-from lib.constants import COVER_QUALITY as SHARED_COVER_QUALITY
-from lib.constants import COVER_WIDTH as SHARED_COVER_WIDTH
-from lib.covers import extract_cover as extract_shared_cover
+from lib.book_paths import format_size
+from lib.cli_common import (
+    EXIT_FAILURE,
+    EXIT_OK,
+    add_base_dir_arg,
+    add_json_arg,
+    add_mode_args,
+    confirm,
+    execute_command,
+    json_mode,
+    run_main,
+)
+from lib.constants import DATA_JSON, DEFAULT_RELEASE_TAG, SAFE_ASSET_NAME_PATTERN
 from lib.json_io import load_books, save_books
 from lib.output import emit_json
-from lib.scanner import scan_book_files
+from lib.scanner import scan_library
 
-# Fix Windows console encoding
-if sys.stdout.encoding != 'utf-8':
-    sys.stdout.reconfigure(encoding='utf-8')
-if sys.stderr.encoding != 'utf-8':
-    sys.stderr.reconfigure(encoding='utf-8')
-
-
-# ══════════════════════════════════════════════════════════
-# CONFIGURATION
-# ══════════════════════════════════════════════════════════
-
-BOOKS_DIR = "Books"
-DATA_JSON = "site/data.json"
-COVER_DIR = "site/assets/covers"
-COVER_WEB_PATH = "assets/covers"
-BOOK_EXTENSIONS = {".pdf", ".epub", ".docx"}
-DEFAULT_TAG = "storage-v1"
-COVER_WIDTH = SHARED_COVER_WIDTH
-COVER_QUALITY = SHARED_COVER_QUALITY
-CATEGORY_PATTERN = re.compile(r"^(\d+)_(.+)$")
+GH_METADATA_TIMEOUT_SECONDS = 60
+UPLOAD_BATCH_SIZE = 10
+UPLOAD_MIN_TIMEOUT_SECONDS = 300
+UPLOAD_MIN_BYTES_PER_SECOND = 100 * 1024
+GENERATE_FIRST_REASON = "data.json and Books/ are out of sync; run ./book generate first"
+GITHUB_REMOTE_PATTERN = re.compile(r"^(?:https?://|ssh://)?(?:[^@/]+@)?github\.com[:/]([^/]+)/([^/]+)$")
+OWNER_REPO_PATTERN = re.compile(r"^[^/\s]+/[^/\s]+$")
 
 
-# ══════════════════════════════════════════════════════════
-# HELPERS
-# ══════════════════════════════════════════════════════════
-
-def sanitize_filename(name: str) -> str:
-    """Create a safe filename from a book title."""
-    return shared_sanitize_filename(name)
+class CommandError(Exception):
+    pass
 
 
-def parse_category_name(folder_name: str) -> str:
-    """'1_Computer_Science_Fundamentals' → 'Computer Science Fundamentals'"""
-    match = CATEGORY_PATTERN.match(folder_name)
-    if match:
-        return match.group(2).replace("_", " ")
-    return folder_name.replace("_", " ")
+class UploadAborted(Exception):
+    def __init__(self, message: str, details: list[str] | None = None, **extra: object) -> None:
+        super().__init__(message)
+        self.details = details or []
+        self.extra = extra
+
+    def summary(self) -> dict:
+        return {"ok": False, "error": str(self), "details": self.details, **self.extra}
 
 
-def parse_topic_name(folder_name: str) -> str:
-    """'Data_Structures_and_Algorithms' → 'Data Structures and Algorithms'"""
-    return folder_name.replace("_", " ")
+@dataclass(frozen=True)
+class UploadItem:
+    file_path: str
+    filename: str
+    abs_path: Path
+    size: int
 
 
-def generate_book_id(file_path: str) -> str:
-    """Generate unique ID: MD5 hash (12 chars) of file_path."""
-    return shared_generate_book_id(file_path)
+@dataclass
+class UploadOutcome:
+    uploaded: list[str] = field(default_factory=list)
+    linked: list[str] = field(default_factory=list)
+    failed: list[str] = field(default_factory=list)
 
 
-def fmt_size(size_bytes: int) -> str:
-    """Format bytes to human-readable string."""
-    return shared_fmt_size(size_bytes)
-
-
-# ══════════════════════════════════════════════════════════
-# COVER EXTRACTION (reuse logic from generate_data.py)
-# ══════════════════════════════════════════════════════════
-
-try:
-    import fitz
-    HAS_PYMUPDF = True
-except ImportError:
-    HAS_PYMUPDF = False
-
-try:
-    from PIL import Image
-    HAS_PILLOW = True
-except ImportError:
-    HAS_PILLOW = False
-
-try:
-    from docx import Document as DocxDocument
-    HAS_PYTHON_DOCX = True
-except ImportError:
-    HAS_PYTHON_DOCX = False
-
-
-def extract_cover(file_path: Path, output_path: Path) -> bool:
-    """Extract a WebP cover using the canonical 600px/q85 policy."""
-    ok = extract_shared_cover(file_path, output_path)
-    if not ok:
-        print(f"    ⚠️  Cover unavailable for {file_path.name}")
-    return ok
-
-
-# ══════════════════════════════════════════════════════════
-# GITHUB CLI HELPERS
-# ══════════════════════════════════════════════════════════
-
-def check_gh_cli() -> bool:
-    """Check if GitHub CLI is installed and authenticated."""
+def run_command(
+    command: list[str],
+    base_dir: Path,
+    *,
+    timeout: float | None = GH_METADATA_TIMEOUT_SECONDS,
+) -> subprocess.CompletedProcess[str]:
     try:
-        result = subprocess.run(
-            ["gh", "auth", "status"],
-            capture_output=True, text=True
-        )
-        return result.returncode == 0
-    except FileNotFoundError:
-        return False
+        return subprocess.run(command, cwd=base_dir, capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError as exc:
+        raise CommandError(f"{command[0]} is not installed") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise CommandError(f"{' '.join(command)} timed out after {timeout}s") from exc
 
 
-def get_repo_info() -> tuple[Optional[str], Optional[str]]:
-    """Get (owner, repo) from git remote."""
+def command_error_text(result: subprocess.CompletedProcess[str]) -> str:
+    return (result.stderr or result.stdout or "").strip() or f"exit code {result.returncode}"
+
+
+def check_gh_cli(base_dir: Path) -> None:
+    result = run_command(["gh", "auth", "status"], base_dir)
+    if result.returncode != 0:
+        raise CommandError(f"GitHub CLI is not authenticated (run `gh auth login`): {command_error_text(result)}")
+
+
+def parse_github_repo(remote_url: str) -> str | None:
+    url = remote_url.strip().rstrip("/").removesuffix(".git")
+    match = GITHUB_REMOTE_PATTERN.match(url)
+    if not match:
+        return None
+    return f"{match.group(1)}/{match.group(2)}"
+
+
+def get_repo_slug(base_dir: Path) -> str | None:
     try:
-        result = subprocess.run(
-            ["git", "remote", "get-url", "origin"],
-            capture_output=True, text=True, check=True
-        )
-        url = result.stdout.strip()
-        if "github.com" in url:
-            parts = url.rstrip(".git").split("github.com")[-1]
-            parts = parts.lstrip(":").lstrip("/")
-            owner, repo = parts.split("/")
-            return owner, repo
-    except Exception:
+        result = run_command(["gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"], base_dir)
+        slug = result.stdout.strip()
+        if result.returncode == 0 and OWNER_REPO_PATTERN.match(slug):
+            return slug
+    except CommandError:
         pass
-    return None, None
-
-
-def get_existing_assets(tag: str) -> set[str]:
-    """Get set of filenames already uploaded to a release."""
     try:
-        result = subprocess.run(
-            ["gh", "release", "view", tag, "--json", "assets", "-q", ".assets[].name"],
-            capture_output=True, text=True
+        result = run_command(["git", "remote", "get-url", "origin"], base_dir)
+    except CommandError:
+        return None
+    if result.returncode != 0:
+        return None
+    return parse_github_repo(result.stdout)
+
+
+def gh_release(repo_slug: str, *args: str) -> list[str]:
+    return ["gh", "release", *args, "-R", repo_slug]
+
+
+def release_exists(tag: str, repo_slug: str, base_dir: Path) -> bool:
+    return run_command(gh_release(repo_slug, "view", tag), base_dir).returncode == 0
+
+
+def create_release(tag: str, repo_slug: str, base_dir: Path) -> None:
+    result = run_command(
+        gh_release(
+            repo_slug, "create", tag,
+            "--title", f"📚 Library Storage ({tag})",
+            "--notes", "Persistent storage for book files (PDF/EPUB/DOCX). Managed by upload_releases.py.",
+            "--latest",
+        ),
+        base_dir,
+    )
+    if result.returncode != 0:
+        raise CommandError(f"Creating release '{tag}' failed: {command_error_text(result)}")
+
+
+def delete_release(tag: str, repo_slug: str, base_dir: Path) -> None:
+    result = run_command(gh_release(repo_slug, "delete", tag, "--yes", "--cleanup-tag"), base_dir)
+    if result.returncode != 0:
+        raise CommandError(f"Deleting release '{tag}' failed: {command_error_text(result)}")
+
+
+def fetch_asset_urls(tag: str, repo_slug: str, base_dir: Path) -> dict[str, str]:
+    result = run_command(gh_release(repo_slug, "view", tag, "--json", "assets"), base_dir)
+    if result.returncode != 0:
+        raise CommandError(f"gh release view {tag} failed: {command_error_text(result)}")
+    try:
+        assets = json.loads(result.stdout).get("assets", [])
+    except (json.JSONDecodeError, AttributeError) as exc:
+        raise CommandError(f"gh release view {tag} returned unreadable JSON: {exc}") from exc
+    return {asset["name"]: asset["url"] for asset in assets if asset.get("name") and asset.get("url")}
+
+
+def batch_timeout(batch: list[UploadItem]) -> float:
+    total_bytes = sum(item.size for item in batch)
+    return max(UPLOAD_MIN_TIMEOUT_SECONDS, total_bytes / UPLOAD_MIN_BYTES_PER_SECOND)
+
+
+def upload_batch(tag: str, repo_slug: str, batch: list[UploadItem], base_dir: Path, *, clobber: bool) -> str | None:
+    command = gh_release(repo_slug, "upload", tag, *(str(item.abs_path) for item in batch))
+    if clobber:
+        command.append("--clobber")
+    try:
+        result = run_command(command, base_dir, timeout=batch_timeout(batch))
+    except CommandError as exc:
+        return str(exc)
+    return None if result.returncode == 0 else command_error_text(result)
+
+
+def batched(items: list[UploadItem], size: int) -> list[list[UploadItem]]:
+    return [items[start:start + size] for start in range(0, len(items), size)]
+
+
+def load_data(base_dir: Path) -> list[dict]:
+    try:
+        data = load_books(base_dir)
+    except (OSError, ValueError) as exc:
+        raise UploadAborted(f"Cannot read {DATA_JSON}: {exc}") from exc
+    invalid = [f"entry {index}" for index, entry in enumerate(data) if not isinstance(entry, dict)]
+    if invalid:
+        raise UploadAborted(f"{DATA_JSON} has entries that are not objects", invalid)
+    return data
+
+
+def check_data_matches_disk(base_dir: Path, data: list[dict]) -> None:
+    scan = scan_library(base_dir)
+    data_paths = {entry.get("file_path") for entry in data}
+    missing_from_data = sorted(book["rel_path"] for book in scan.books if book["rel_path"] not in data_paths)
+    missing_on_disk = [
+        str(entry.get("file_path") or f"entry {index} without file_path")
+        for index, entry in enumerate(data)
+        if not entry.get("file_path") or not (base_dir / str(entry["file_path"])).is_file()
+    ]
+    skipped = [skipped.path for skipped in scan.skipped]
+    if missing_from_data or missing_on_disk or skipped:
+        raise UploadAborted(
+            GENERATE_FIRST_REASON,
+            [*(f"not in data.json: {path}" for path in missing_from_data),
+             *(f"no file on disk: {path}" for path in missing_on_disk),
+             *(f"skipped by scanner: {path}" for path in skipped)],
+            reason=GENERATE_FIRST_REASON,
+            missing_from_data=missing_from_data,
+            missing_on_disk=missing_on_disk,
+            skipped_files=skipped,
         )
-        if result.returncode == 0 and result.stdout.strip():
-            return set(result.stdout.strip().splitlines())
-    except Exception:
-        pass
-    return set()
 
 
-def ensure_release(tag: str) -> bool:
-    """Create release if it doesn't exist."""
-    check = subprocess.run(
-        ["gh", "release", "view", tag],
-        capture_output=True, text=True
-    )
-    if check.returncode == 0:
-        return True
-
-    result = subprocess.run(
-        ["gh", "release", "create", tag,
-         "--title", f"📚 Library Storage ({tag})",
-         "--notes", "Persistent storage for book files (PDF/EPUB/DOCX). Managed by upload_releases.py.",
-         "--latest"],
-        capture_output=True, text=True
-    )
-    return result.returncode == 0
-
-
-def upload_asset(tag: str, file_path: str) -> bool:
-    """Upload a single file to release. --clobber overwrites if exists."""
-    result = subprocess.run(
-        ["gh", "release", "upload", tag, file_path, "--clobber"],
-        capture_output=True, text=True
-    )
-    return result.returncode == 0
-
-
-def get_asset_url(tag: str, filename: str, owner: str, repo: str) -> str:
-    """Construct GitHub Releases download URL.
-
-    Filenames MUST be ASCII-safe with underscores only (no spaces, no Unicode).
-    Run `rename_books.py --execute` before uploading to ensure this.
-    """
-    return f"https://github.com/{owner}/{repo}/releases/download/{tag}/{filename}"
-
-
-# ══════════════════════════════════════════════════════════
-# CORE: SMART INCREMENTAL SYNC
-# ══════════════════════════════════════════════════════════
-
-def scan_local_books(base_dir: Path) -> list[dict]:
-    """Scan Books/ directory, return list of book metadata."""
-    books_root = base_dir / BOOKS_DIR
-    if not books_root.exists():
-        print(f"❌ Books directory not found: {books_root}")
-        return []
-    return scan_book_files(base_dir)
-
-
-def load_data_json(base_dir: Path) -> list[dict]:
-    """Load existing data.json."""
-    try:
-        return load_books(base_dir)
-    except (json.JSONDecodeError, IOError, ValueError):
-        return []
-
-
-def save_data_json(base_dir: Path, data: list[dict]) -> None:
-    """Save data.json (preserve formatting)."""
-    save_books(base_dir, data, backup=True)
-
-
-def compute_diff(local_books: list[dict], existing_data: list[dict], force: bool = False) -> tuple[list[dict], list[dict]]:
-    """
-    Compare local books vs data.json to find:
-      - new_books: files on disk but NOT in data.json
-      - need_upload: files in data.json but missing download_url
-
-    Returns: (new_books, need_upload)
-    """
-    # Index existing entries by file_path
-    existing_map = {entry["file_path"]: entry for entry in existing_data}
-
-    new_books = []
-    need_upload = []
-
-    for book in local_books:
-        rel_path = book["rel_path"]
-
-        if rel_path not in existing_map:
-            # Completely new file — not in data.json
-            new_books.append(book)
-        elif force:
-            # Force mode — re-upload everything
-            need_upload.append(book)
-        elif not existing_map[rel_path].get("download_url"):
-            # In data.json but missing download URL
-            need_upload.append(book)
-
-    return new_books, need_upload
-
-
-def create_covers_for_new(base_dir: Path, new_books: list[dict]) -> dict[str, str]:
-    """Extract WebP covers for new books. Returns {rel_path: cover_web_path}."""
-    covers_dir = base_dir / COVER_DIR
-    covers_dir.mkdir(parents=True, exist_ok=True)
-
-    cover_map = {}
-    for book in new_books:
-        cover_filename = sanitize_filename(book["title"]) + ".webp"
-        cover_path = covers_dir / cover_filename
-        cover_web = f"{COVER_WEB_PATH}/{cover_filename}"
-
-        if cover_path.exists():
-            print(f"    ⏭️  Cover exists: {cover_filename}")
-            cover_map[book["rel_path"]] = cover_web
-            continue
-
-        print(f"    🖼️  Extracting: {cover_filename}...", end=" ", flush=True)
-        if extract_cover(book["abs_path"], cover_path):
-            cover_map[book["rel_path"]] = cover_web
-            size = cover_path.stat().st_size
-            print(f"✅ ({fmt_size(size)})")
-        else:
-            print("❌ (no cover)")
-            cover_map[book["rel_path"]] = ""
-
-    return cover_map
-
-
-# ══════════════════════════════════════════════════════════
-# MAIN ORCHESTRATOR
-# ══════════════════════════════════════════════════════════
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="📚 Smart Incremental Sync — Upload only NEW books to GitHub Releases"
-    )
-    parser.add_argument("--base-dir", default=".", help="Project root directory")
-    parser.add_argument("--tag", default=DEFAULT_TAG, help=f"Release tag (default: {DEFAULT_TAG})")
-    parser.add_argument("--dry-run", action="store_true", help="Preview changes without uploading")
-    parser.add_argument("--force", action="store_true", help="Re-upload ALL books (ignore existing)")
-    parser.add_argument("--json", action="store_true", help="Emit a machine-readable JSON summary")
-    parser.add_argument("--yes", "-y", action="store_true", help="Skip hard-reset confirmation prompt")
-    parser.add_argument("--hard-reset", action="store_true",
-                        help="DELETE existing release entirely, recreate, and re-upload ALL files")
-    args = parser.parse_args()
-
-    base_dir = Path(args.base_dir).resolve()
-    os.chdir(base_dir)
-    tag = args.tag
-
-    # ── Hard Reset Mode ──
-    if args.hard_reset:
-        print("\n" + "⚠️" * 20)
-        print("  HARD RESET MODE: This will DELETE the entire release")
-        print("  and re-upload ALL books from scratch.")
-        print("⚠️" * 20 + "\n")
-
-        if not args.dry_run:
-            if not args.yes:
-                response = input("Type yes to continue hard reset: ").strip().lower()
-                if response not in ("yes", "y"):
-                    print("❌ Cancelled.")
-                    return
-            if not check_gh_cli():
-                print("❌ GitHub CLI (gh) not installed or not authenticated.")
-                sys.exit(1)
-
-            # Step 1: Delete existing release
-            print(f"🗑️  Deleting release '{tag}'...")
-            result = subprocess.run(
-                ["gh", "release", "delete", tag, "--yes", "--cleanup-tag"],
-                capture_output=True, text=True
-            )
-            if result.returncode == 0:
-                print("   ✅ Release deleted")
-            else:
-                print(f"   ⚠️  Delete result: {result.stderr.strip() or 'release may not exist'}")
-
-            # Step 2: Clear all download_urls in data.json
-            print("📝 Clearing all download_urls in data.json...")
-            data = load_data_json(base_dir)
-            for entry in data:
-                entry["download_url"] = ""
-            save_data_json(base_dir, data)
-            print(f"   ✅ Cleared {len(data)} entries")
-
-            # Step 3: Recreate release
-            print(f"🚀 Recreating release '{tag}'...")
-            if ensure_release(tag):
-                print("   ✅ Release created")
-            else:
-                print("   ❌ Failed to create release")
-                sys.exit(1)
-
-        # Force-upload everything
-        args.force = True
-
-    # ── Header ──
-    print("=" * 60)
-    print("📚 My Bookshelves — Smart Incremental Sync")
-    print("=" * 60)
-
-    # ── Prerequisites ──
-    if not args.dry_run:
-        if not check_gh_cli():
-            print("\n❌ GitHub CLI (gh) not installed or not authenticated.")
-            print("   Install: https://cli.github.com/")
-            print("   Auth:    gh auth login")
-            sys.exit(1)
-        print("✅ GitHub CLI authenticated")
-
-    owner, repo = get_repo_info()
-    if owner and repo:
-        print(f"📦 Repository: {owner}/{repo}")
-    else:
-        print("⚠️  Could not detect repo info")
-        if not args.dry_run:
-            sys.exit(1)
-
-    print(f"🏷️  Release tag: {tag}")
-
-    # ── Step 1: Scan local books ──
-    print(f"\n{'─' * 60}")
-    print("📂 Step 1: Scanning local books...")
-    local_books = scan_local_books(base_dir)
-    total_size = sum(b["size"] for b in local_books)
-    print(f"   Found {len(local_books)} books ({fmt_size(total_size)})")
-
-    if not local_books:
-        print("⚠️  No books found. Nothing to do.")
-        return
-
-    # ── Step 2: Load data.json ──
-    print(f"\n{'─' * 60}")
-    print("📋 Step 2: Loading data.json...")
-    existing_data = load_data_json(base_dir)
-    already_uploaded = sum(1 for e in existing_data if e.get("download_url"))
-    print(f"   {len(existing_data)} entries, {already_uploaded} already uploaded")
-
-    # ── Step 3: Compute diff ──
-    print(f"\n{'─' * 60}")
-    print("🔍 Step 3: Computing diff...")
-    new_books, need_upload = compute_diff(local_books, existing_data, force=args.force)
-
-    all_to_upload = new_books + need_upload
-    upload_size = sum(b["size"] for b in all_to_upload)
-
-    print(f"   📗 New books (not in data.json): {len(new_books)}")
-    print(f"   📙 Missing download_url:         {len(need_upload)}")
-    print(f"   📕 Already synced (skip):         {len(local_books) - len(all_to_upload)}")
-
-    if not all_to_upload:
-        if args.json:
-            emit_json({
-                "ok": True,
-                "dry_run": args.dry_run,
-                "tag": tag,
-                "local_books": len(local_books),
-                "new_books": 0,
-                "need_upload": 0,
-                "would_upload": 0,
-                "upload_size_bytes": 0,
-                "files": [],
-            })
-        print(f"\n✅ Everything is in sync! Nothing to upload.")
-        return
-
-    print(f"\n   📤 Total to upload: {len(all_to_upload)} files ({fmt_size(upload_size)})")
-    for b in all_to_upload:
-        status = "NEW" if b in new_books else "RE-UPLOAD"
-        print(f"      [{status}] {b['filename']} ({fmt_size(b['size'])})")
-
-    if args.dry_run:
-        summary = {
-            "ok": True,
-            "dry_run": True,
-            "tag": tag,
-            "local_books": len(local_books),
-            "new_books": len(new_books),
-            "need_upload": len(need_upload),
-            "would_upload": len(all_to_upload),
-            "upload_size_bytes": upload_size,
-            "files": all_to_upload,
-        }
-        if args.json:
-            emit_json(summary)
-        print(f"\n{'═' * 60}")
-        print(f"🔍 DRY RUN — No files uploaded.")
-        print("   No covers or data files were written.")
-        print(f"   Would upload {len(all_to_upload)} files ({fmt_size(upload_size)})")
-        print(f"   Would add {len(new_books)} new entries to data.json")
-        print(f"{'═' * 60}")
-        return
-
-    # ── Step 4: Create covers for new books ──
-    if new_books:
-        print(f"\n{'─' * 60}")
-        print(f"🖼️  Step 4: Creating covers for {len(new_books)} new books...")
-        cover_map = create_covers_for_new(base_dir, new_books)
-    else:
-        cover_map = {}
-
-    # ── Step 5: Ensure release exists ──
-    print(f"\n{'─' * 60}")
-    print(f"🚀 Step 5: Ensuring release '{tag}' exists...")
-    if not ensure_release(tag):
-        print("❌ Failed to create/verify release")
-        sys.exit(1)
-    print("   ✅ Release ready")
-
-    # ── Step 6: Upload only new/missing files ──
-    print(f"\n{'─' * 60}")
-    print(f"📤 Step 6: Uploading {len(all_to_upload)} files...")
-    url_map = {}
-    uploaded = 0
-    failed = 0
-
-    for book in all_to_upload:
-        print(f"   📤 {book['filename']} ({fmt_size(book['size'])})...", end=" ", flush=True)
-        if upload_asset(tag, str(book["abs_path"])):
-            url = get_asset_url(tag, book["filename"], owner, repo)
-            url_map[book["rel_path"]] = url
-            uploaded += 1
-            print("✅")
-        else:
-            failed += 1
-            print("❌")
-
-    # ── Step 7: Update data.json ──
-    print(f"\n{'─' * 60}")
-    print("📝 Step 7: Updating data.json...")
-
-    # Reload data.json (fresh)
-    data = load_data_json(base_dir)
-    existing_paths = {entry["file_path"] for entry in data}
-
-    # Append NEW book entries
-    new_count = 0
-    for book in new_books:
-        if book["rel_path"] not in existing_paths:
-            entry = {
-                "id": generate_book_id(book["rel_path"]),
-                "title": book["title"],
-                "category": book["category"],
-                "topic": book["topic"],
-                "file_path": book["rel_path"],
-                "cover": cover_map.get(book["rel_path"], ""),
-                "format": book["format"],
-                "description": "",
-                "download_url": url_map.get(book["rel_path"], ""),
-            }
-            data.append(entry)
-            new_count += 1
-
-    # Update download_url for existing entries (re-upload / missing)
-    url_updated = 0
+def select_uploads(base_dir: Path, data: list[dict], *, upload_all: bool) -> list[UploadItem]:
+    items = []
     for entry in data:
-        fp = entry.get("file_path", "")
-        if fp in url_map:
-            entry["download_url"] = url_map[fp]
-            url_updated += 1
+        if not upload_all and entry.get("download_url"):
+            continue
+        abs_path = base_dir / str(entry["file_path"])
+        items.append(UploadItem(
+            file_path=str(entry["file_path"]),
+            filename=abs_path.name,
+            abs_path=abs_path,
+            size=abs_path.stat().st_size,
+        ))
+    return items
 
-    save_data_json(base_dir, data)
-    print(f"   ✅ Appended {new_count} new entries")
-    print(f"   ✅ Updated {url_updated} download URLs")
 
-    # ── Summary ──
-    print(f"\n{'═' * 60}")
-    print("📊 Sync Summary:")
-    print(f"   ✅ Uploaded:  {uploaded}/{len(all_to_upload)} files")
-    if failed:
-        print(f"   ❌ Failed:    {failed}")
-    print(f"   📗 New added: {new_count} entries to data.json")
-    print(f"   💾 Data sent: {fmt_size(upload_size)}")
-    print(f"   ⏭️  Skipped:   {len(local_books) - len(all_to_upload)} (already synced)")
-    print(f"   🏷️  Release:   {tag}")
-    print(f"\n   Next step: git add site/data.json site/assets/covers/ && git commit && git push")
-    print(f"{'═' * 60}")
+def asset_name_problems(to_upload: list[UploadItem], data: list[dict]) -> list[str]:
+    paths_by_filename: dict[str, list[str]] = {}
+    for entry in data:
+        file_path = str(entry["file_path"])
+        paths_by_filename.setdefault(Path(file_path).name, []).append(file_path)
+    problems = []
+    for item in to_upload:
+        if not re.match(SAFE_ASSET_NAME_PATTERN, item.filename):
+            problems.append(f"{item.file_path}: unsafe asset name; run `./book rename --execute` first")
+        if len(paths_by_filename.get(item.filename, [])) > 1:
+            others = [path for path in paths_by_filename[item.filename] if path != item.file_path]
+            problems.append(
+                f"{item.file_path}: same filename as {', '.join(others)}; "
+                "release assets share one namespace, rename one of them"
+            )
+    return problems
 
+
+def mode_name(args: argparse.Namespace) -> str:
+    if args.hard_reset:
+        return "hard-reset"
+    if args.force:
+        return "force"
+    return "incremental"
+
+
+def confirm_destructive_mode(args: argparse.Namespace, upload_count: int) -> bool:
+    if args.hard_reset:
+        question = f"DELETE release '{args.tag}', recreate it and re-upload {upload_count} books?"
+    elif args.force:
+        question = f"Re-upload {upload_count} books to '{args.tag}', overwriting existing assets?"
+    else:
+        return True
+    return confirm(question, assume_yes=args.yes)
+
+
+def prepare_release(args: argparse.Namespace, repo_slug: str, base_dir: Path) -> dict[str, str]:
+    exists = release_exists(args.tag, repo_slug, base_dir)
+    if args.hard_reset and exists:
+        print(f"🗑️  Deleting release '{args.tag}'...")
+        delete_release(args.tag, repo_slug, base_dir)
+        exists = False
+    if not exists:
+        print(f"🚀 Creating release '{args.tag}'...")
+        create_release(args.tag, repo_slug, base_dir)
+        return {}
+    return fetch_asset_urls(args.tag, repo_slug, base_dir)
+
+
+def upload_items(
+    args: argparse.Namespace,
+    repo_slug: str,
+    base_dir: Path,
+    to_upload: list[UploadItem],
+    existing_assets: dict[str, str],
+) -> tuple[UploadOutcome, dict[str, str]]:
+    outcome = UploadOutcome()
+    reupload = args.force or args.hard_reset
+    pending = [item for item in to_upload if reupload or item.filename not in existing_assets]
+    outcome.linked = [item.file_path for item in to_upload if item not in pending]
+    for file_path in outcome.linked:
+        print(f"   🔗 {Path(file_path).name}: already on the release, linking")
+
+    failed_paths: set[str] = set()
+    for batch in batched(pending, UPLOAD_BATCH_SIZE):
+        names = ", ".join(item.filename for item in batch)
+        print(f"   📤 Uploading {len(batch)} files ({format_size(sum(item.size for item in batch))}): {names}")
+        error = upload_batch(args.tag, repo_slug, batch, base_dir, clobber=args.force)
+        if error:
+            print(f"   ❌ Batch failed: {error}", file=sys.stderr)
+            failed_paths.update(item.file_path for item in batch)
+
+    asset_urls = fetch_asset_urls(args.tag, repo_slug, base_dir) if pending else existing_assets
+    url_map: dict[str, str] = {}
+    for item in to_upload:
+        url = asset_urls.get(item.filename)
+        if url and item.file_path not in failed_paths:
+            url_map[item.file_path] = url
+            if item.file_path not in outcome.linked:
+                outcome.uploaded.append(item.file_path)
+        else:
+            outcome.failed.append(item.file_path)
+            if item.file_path not in failed_paths:
+                print(f"   ❌ {item.filename}: not listed on release '{args.tag}' after upload", file=sys.stderr)
+    return outcome, url_map
+
+
+def apply_download_urls(base_dir: Path, data: list[dict], url_map: dict[str, str]) -> int:
+    updated = 0
+    for entry in data:
+        url = url_map.get(str(entry.get("file_path")))
+        if url and entry.get("download_url") != url:
+            entry["download_url"] = url
+            updated += 1
+    if updated:
+        save_books(base_dir, data, backup=True)
+    return updated
+
+
+def plan_summary(args: argparse.Namespace, data: list[dict], to_upload: list[UploadItem], argv: list[str]) -> dict:
+    return {
+        "ok": True,
+        "dry_run": True,
+        "mode": mode_name(args),
+        "tag": args.tag,
+        "books": len(data),
+        "would_upload": len(to_upload),
+        "upload_size_bytes": sum(item.size for item in to_upload),
+        "files": [{"file_path": item.file_path, "size": item.size} for item in to_upload],
+        "execute_command": execute_command("upload", argv),
+    }
+
+
+def print_plan(args: argparse.Namespace, data: list[dict], to_upload: list[UploadItem]) -> None:
+    already_uploaded = sum(1 for entry in data if entry.get("download_url"))
+    print(f"📋 data.json: {len(data)} entries, {already_uploaded} with download_url")
+    print(f"🏷️  Release tag: {args.tag} ({mode_name(args)})")
+    if args.hard_reset:
+        print(f"⚠️  Hard reset deletes release '{args.tag}' and re-uploads every book.")
+    if not to_upload:
+        print("✅ Everything is in sync. Nothing to upload.")
+        return
+    upload_size = sum(item.size for item in to_upload)
+    print(f"📤 To upload: {len(to_upload)} files ({format_size(upload_size)})")
+    for item in to_upload:
+        print(f"   {item.filename} ({format_size(item.size)})")
+
+
+def upload(args: argparse.Namespace, argv: list[str]) -> tuple[int, dict]:
+    base_dir = args.base_dir.resolve()
+    data = load_data(base_dir)
+    check_data_matches_disk(base_dir, data)
+
+    to_upload = select_uploads(base_dir, data, upload_all=args.force or args.hard_reset)
+    problems = asset_name_problems(to_upload, data)
+    if problems:
+        raise UploadAborted("Some files cannot be uploaded as release assets", problems)
+
+    print_plan(args, data, to_upload)
+    if not args.execute:
+        print(f"🔍 DRY RUN — nothing uploaded. Run: {execute_command('upload', argv)}")
+        return EXIT_OK, plan_summary(args, data, to_upload, argv)
+    if not to_upload:
+        return EXIT_OK, {"ok": True, "dry_run": False, "mode": mode_name(args), "tag": args.tag,
+                         "uploaded": 0, "linked": 0, "failed": [], "download_urls_updated": 0}
+
+    if not confirm_destructive_mode(args, len(to_upload)):
+        print("❌ Cancelled.", file=sys.stderr)
+        return EXIT_FAILURE, {"ok": False, "error": "cancelled"}
+
+    try:
+        check_gh_cli(base_dir)
+        repo_slug = get_repo_slug(base_dir)
+        if not repo_slug:
+            raise UploadAborted("Could not detect the GitHub repository (gh repo view / git remote origin)")
+        print(f"📦 Repository: {repo_slug}")
+        existing_assets = prepare_release(args, repo_slug, base_dir)
+        outcome, url_map = upload_items(args, repo_slug, base_dir, to_upload, existing_assets)
+    except CommandError as exc:
+        raise UploadAborted(str(exc)) from exc
+
+    updated = apply_download_urls(base_dir, data, url_map)
+    print(f"📝 Updated {updated} download URLs in {DATA_JSON}")
+    print(f"📊 Uploaded {len(outcome.uploaded)}, linked {len(outcome.linked)}, failed {len(outcome.failed)}")
+    if not outcome.failed:
+        print("   Next step: git add data/data.json && git commit && git push")
+    return (EXIT_FAILURE if outcome.failed else EXIT_OK), {
+        "ok": not outcome.failed,
+        "dry_run": False,
+        "mode": mode_name(args),
+        "tag": args.tag,
+        "repo": repo_slug,
+        "uploaded": len(outcome.uploaded),
+        "linked": len(outcome.linked),
+        "failed": outcome.failed,
+        "download_urls_updated": updated,
+    }
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Upload book files listed in data.json to GitHub Releases")
+    add_base_dir_arg(parser)
+    add_json_arg(parser)
+    add_mode_args(parser, execute_help="Upload files and write download_url into data.json")
+    parser.add_argument("--tag", default=DEFAULT_RELEASE_TAG, help=f"Release tag (default: {DEFAULT_RELEASE_TAG})")
+    reset_mode = parser.add_mutually_exclusive_group()
+    reset_mode.add_argument("--force", action="store_true",
+                            help="Re-upload ALL books, overwriting existing assets (needs --yes)")
+    reset_mode.add_argument("--hard-reset", action="store_true",
+                            help="DELETE the release, recreate it and re-upload ALL books (needs --yes)")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    args = build_parser().parse_args(argv)
+    with json_mode(args.json):
+        try:
+            exit_code, summary = upload(args, argv)
+        except UploadAborted as exc:
+            print(f"❌ {exc}", file=sys.stderr)
+            for detail in exc.details:
+                print(f"   - {detail}", file=sys.stderr)
+            exit_code, summary = EXIT_FAILURE, exc.summary()
     if args.json:
-        emit_json({
-            "ok": failed == 0,
-            "dry_run": False,
-            "tag": tag,
-            "uploaded": uploaded,
-            "failed": failed,
-            "new_entries": new_count,
-            "download_urls_updated": url_updated,
-            "skipped": len(local_books) - len(all_to_upload),
-        })
-
-    if failed:
-        sys.exit(1)
+        emit_json(summary)
+    return exit_code
 
 
 if __name__ == "__main__":
-    main()
+    run_main(main)

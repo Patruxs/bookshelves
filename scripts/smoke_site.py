@@ -1,122 +1,43 @@
-"""Smoke checks for the static My Bookshelves site.
-
-This script intentionally uses only the Python standard library so it can run
-before JavaScript tooling exists. It validates the contracts most likely to
-break during frontend refactors.
-"""
-
+#!/usr/bin/env python3
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import json
+import http.client
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
-
-REQUIRED_BOOK_FIELDS = {
-    "id",
-    "title",
-    "category",
-    "topic",
-    "file_path",
-    "cover",
-    "format",
-}
+from lib.cli_common import EXIT_FAILURE, EXIT_OK, add_base_dir_arg, add_json_arg, json_mode, run_main
+from lib.json_io import load_books
+from lib.output import emit_json
+from lib.validation import validate_library
 
 
 def fail(message: str, failures: list[str]) -> None:
     failures.append(message)
 
 
-def load_json(path: Path, failures: list[str]) -> list[dict[str, object]]:
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except Exception as exc:  # pragma: no cover - smoke output matters here.
-        fail(f"{path}: could not parse JSON: {exc}", failures)
-        return []
-
-    if not isinstance(payload, list):
-        fail(f"{path}: expected a top-level list", failures)
-        return []
-
-    books: list[dict[str, object]] = []
-    for index, item in enumerate(payload):
-        if not isinstance(item, dict):
-            fail(f"{path}: item {index} is not an object", failures)
-            continue
-        books.append(item)
-    return books
+def validate_data(base_dir: Path, failures: list[str]) -> tuple[list[dict[str, object]], int]:
+    result = validate_library(base_dir, include_dependencies=False)
+    for issue in result["errors"]:
+        fail(f"{issue['file']}: {issue['message']}", failures)
+    if any(issue["code"] in {"missing_data_json", "invalid_json"} for issue in result["errors"]):
+        return [], len(result["warnings"])
+    books = [book for book in load_books(base_dir) if isinstance(book, dict)]
+    return books, len(result["warnings"])
 
 
-def display_name_from_folder(folder_name: str) -> str:
-    """Convert a disk folder segment to its data.json display name."""
-    return re.sub(r"^\d+_", "", folder_name).replace("_", " ").strip()
-
-
-def expected_metadata_from_file_path(file_path: str) -> tuple[str, str] | None:
-    parts = Path(file_path).parts
-    if len(parts) < 4 or parts[0] != "Books":
-        return None
-
-    category = display_name_from_folder(parts[1])
-    topic = "/".join(display_name_from_folder(part) for part in parts[2:-1])
-    return category, topic
-
-
-def validate_books(
-    site_dir: Path,
+def validate_download_url_fields(
     books: list[dict[str, object]],
     failures: list[str],
     allow_missing_download_url: bool,
 ) -> None:
-    seen_ids: set[str] = set()
     for index, book in enumerate(books):
         label = str(book.get("title") or f"book #{index}")
-        missing = sorted(field for field in REQUIRED_BOOK_FIELDS if not book.get(field))
-        if missing:
-            fail(f"{label}: missing required fields: {', '.join(missing)}", failures)
-
-        book_id = str(book.get("id") or "")
-        if book_id in seen_ids:
-            fail(f"{label}: duplicate id {book_id}", failures)
-        if book_id:
-            seen_ids.add(book_id)
-
-        category = str(book.get("category") or "")
-        topic = str(book.get("topic") or "")
-        if "_" in category:
-            fail(f"{label}: category must use display spaces, got {category!r}", failures)
-        if "_" in topic:
-            fail(f"{label}: topic must use display spaces, got {topic!r}", failures)
-
-        file_path = str(book.get("file_path") or "")
-        expected_metadata = expected_metadata_from_file_path(file_path)
-        if expected_metadata is None:
-            fail(f"{label}: file_path must be under Books/<Category>/<Topic>/, got {file_path!r}", failures)
-        else:
-            expected_category, expected_topic = expected_metadata
-            if category != expected_category:
-                fail(
-                    f"{label}: category {category!r} does not match file_path folder {expected_category!r}",
-                    failures,
-                )
-            if topic != expected_topic:
-                fail(
-                    f"{label}: topic {topic!r} does not match file_path folder {expected_topic!r}",
-                    failures,
-                )
-
-        cover = str(book.get("cover") or "")
-        if cover and not re.fullmatch(r"assets/covers/[-\w.%/]+\.webp", cover, re.IGNORECASE):
-            fail(f"{label}: cover must be a local WebP under assets/covers, got {cover!r}", failures)
-        elif cover and not (site_dir / cover).exists():
-            fail(f"{label}: cover file does not exist: {cover}", failures)
-
         download_url = str(book.get("download_url") or "")
         if not download_url and not allow_missing_download_url:
             fail(f"{label}: missing download_url", failures)
@@ -126,50 +47,53 @@ def validate_books(
                 fail(f"{label}: download_url must be http(s), got {download_url!r}", failures)
 
 
-def validate_html(site_dir: Path, failures: list[str]) -> None:
-    index_path = site_dir / "index.html"
+def validate_web_sources(base_dir: Path, failures: list[str]) -> None:
+    web_dir = base_dir / "web"
+    required = [
+        web_dir / "package.json",
+        web_dir / "vite.config.ts",
+        web_dir / "index.html",
+        web_dir / "src" / "main.tsx",
+        web_dir / "src" / "App.tsx",
+    ]
+    for path in required:
+        if not path.exists():
+            fail(f"{path.relative_to(base_dir)}: missing", failures)
+    config_path = web_dir / "vite.config.ts"
+    if config_path.exists():
+        config = config_path.read_text(encoding="utf-8")
+        if 'REPO_BASE = "/bookshelves/"' not in config:
+            fail("web/vite.config.ts: REPO_BASE must be \"/bookshelves/\" for GitHub Pages", failures)
+        for library_path in ('"data/data.json"', '"assets/covers"'):
+            if library_path not in config:
+                fail(f"web/vite.config.ts: {library_path} must ship with the build via the library-files plugin", failures)
+    if (base_dir / "site").exists():
+        fail("site/: retired folder still exists; data lives in data/ and covers in assets/covers/", failures)
+
+
+def validate_web_dist(base_dir: Path, failures: list[str]) -> bool:
+    dist_dir = base_dir / "web" / "dist"
+    if not dist_dir.exists():
+        return False
+    index_path = dist_dir / "index.html"
     try:
         html = index_path.read_text(encoding="utf-8")
     except Exception as exc:
-        fail(f"{index_path}: could not read HTML: {exc}", failures)
-        return
-
-    app_scripts = re.findall(r'<script[^>]+type=["\']module["\'][^>]+src=["\']([^"\']+)["\']', html)
-    if not any(src.split("?")[0] == "./app.js" for src in app_scripts):
-        fail("site/index.html: expected module script loading ./app.js", failures)
-
-    required_ids = [
-        "home-view",
-        "detail-view",
-        "grid",
-        "skeleton",
-        "search",
-        "pagination",
-        "filter-panel",
-        "sb-tree",
-        "toast",
-    ]
-    for element_id in required_ids:
-        if f'id="{element_id}"' not in html:
-            fail(f"site/index.html: missing #{element_id}", failures)
-
-
-def validate_js_imports(site_dir: Path, failures: list[str]) -> None:
-    js_files = [site_dir / "app.js", *sorted((site_dir / "js").glob("**/*.js"))]
-    import_pattern = re.compile(r'import\s+(?:[^"\']+\s+from\s+)?["\'](\.{1,2}/[^"\']+)["\']')
-
-    for js_file in js_files:
-        if not js_file.exists():
-            continue
-        text = js_file.read_text(encoding="utf-8")
-        for import_path in import_pattern.findall(text):
-            target = (js_file.parent / import_path.split("?", 1)[0]).resolve()
-            if not target.exists():
-                fail(f"{js_file.relative_to(site_dir.parent)}: missing import {import_path}", failures)
+        fail(f"web/dist/index.html: could not read: {exc}", failures)
+        return True
+    scripts = re.findall(r'<script[^>]+type=["\']module["\'][^>]+src=["\']([^"\']+)["\']', html)
+    if not any(src.startswith("/bookshelves/assets/") for src in scripts):
+        fail("web/dist/index.html: expected a module script under /bookshelves/assets/", failures)
+    if not (dist_dir / "404.html").exists():
+        fail("web/dist/404.html: missing SPA fallback page", failures)
+    if not (dist_dir / "data.json").exists():
+        fail("web/dist/data.json: missing; library-files plugin did not copy data/data.json", failures)
+    if not (dist_dir / "assets" / "covers").is_dir():
+        fail("web/dist/assets/covers: missing; library-files plugin did not copy assets/covers", failures)
+    return True
 
 
 def validate_download_urls(books: list[dict[str, object]], failures: list[str]) -> None:
-    """Check that published download URLs are reachable."""
     targets: list[tuple[str, str]] = []
     for index, book in enumerate(books):
         label = str(book.get("title") or f"book #{index}")
@@ -190,19 +114,20 @@ def validate_download_urls(books: list[dict[str, object]], failures: list[str]) 
             return f"{label}: download_url could not be reached: {exc.reason}: {download_url}"
         except TimeoutError:
             return f"{label}: download_url timed out: {download_url}"
+        except (OSError, http.client.HTTPException) as exc:
+            return f"{label}: download_url check failed: {exc}: {download_url}"
         return None
 
     with ThreadPoolExecutor(max_workers=12) as executor:
-        futures = [executor.submit(check, target) for target in targets]
-        for future in as_completed(futures):
-            failure = future.result()
+        for failure in executor.map(check, targets):
             if failure:
                 fail(failure, failures)
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Smoke check the static site.")
-    parser.add_argument("--base-dir", default=".", help="Repository root")
+    add_base_dir_arg(parser)
+    add_json_arg(parser)
     parser.add_argument(
         "--allow-missing-download-url",
         action="store_true",
@@ -213,28 +138,49 @@ def main() -> int:
         action="store_true",
         help="Perform network checks for each non-empty download_url",
     )
-    args = parser.parse_args()
+    return parser
 
-    base_dir = Path(args.base_dir).resolve()
-    site_dir = base_dir / "site"
+
+def run_smoke_checks(args: argparse.Namespace) -> dict:
+    base_dir = args.base_dir.resolve()
     failures: list[str] = []
 
-    books = load_json(site_dir / "data.json", failures)
-    validate_books(site_dir, books, failures, args.allow_missing_download_url)
+    books, warning_count = validate_data(base_dir, failures)
+    validate_download_url_fields(books, failures, args.allow_missing_download_url)
     if args.check_download_urls:
         validate_download_urls(books, failures)
-    validate_html(site_dir, failures)
-    validate_js_imports(site_dir, failures)
+    validate_web_sources(base_dir, failures)
+    has_dist = validate_web_dist(base_dir, failures)
+    return {
+        "ok": not failures,
+        "failures": failures,
+        "books": len(books),
+        "warnings": warning_count,
+        "dist_checked": has_dist,
+    }
 
-    if failures:
-        print("Smoke checks failed:")
-        for failure in failures:
-            print(f"- {failure}")
-        return 1
 
-    print(f"Smoke checks passed: {len(books)} books, static site contracts OK.")
-    return 0
+def print_report(result: dict) -> None:
+    if result["failures"]:
+        print("Smoke checks failed:", file=sys.stderr)
+        for failure in result["failures"]:
+            print(f"- {failure}", file=sys.stderr)
+        return
+    dist_note = "built web/dist checked" if result["dist_checked"] else "web/dist not built, sources only"
+    print(f"Smoke checks passed: {result['books']} books, web app contracts OK ({dist_note}).")
+    if result["warnings"]:
+        print(f"{result['warnings']} data warnings; run `book doctor` for details.")
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    with json_mode(args.json):
+        result = run_smoke_checks(args)
+        print_report(result)
+    if args.json:
+        emit_json(result)
+    return EXIT_OK if result["ok"] else EXIT_FAILURE
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    run_main(main)

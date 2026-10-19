@@ -1901,5 +1901,27 @@
     "format": "pdf",
     "description": "Thương mại điện tử đã trở thành xương sống của nền kinh tế số, thay đổi hoàn toàn cách doanh nghiệp vận hành và khách hàng mua sắm. Hiểu biết về TMDT không chỉ dành cho dân kinh doanh mà cả kỹ sư xây dựng nền tảng.\n\nGiáo trình này bao quát toàn bộ hệ sinh thái TMDT: từ mô hình kinh doanh, hệ thống thanh toán trực tuyến đến marketing số và bảo mật giao dịch.\n\n• Hiểu các mô hình kinh doanh: B2B, B2C, C2C, O2O và marketplace\n• Thiết kế hệ thống thanh toán trực tuyến: cổng thanh toán, ví điện tử và bảo mật\n• Áp dụng marketing số: SEO, SEM, email marketing và social media\n• Xây dựng chiến lược logistics và quản lý chuỗi cung ứng\n• Đảm bảo pháp lý: luật TMDT, bảo vệ người tiêu dùng và thuế điện tử",
     "download_url": "https://github.com/Patruxs/bookshelves/releases/download/storage-v1/Thuong_mai_dien_tu.pdf"
+  },
+  {
+    "id": "b1a6c3f3e6c9",
+    "title": "Tu_code_den_cloud",
+    "category": "Software Engineering",
+    "topic": "DevOps",
+    "file_path": "Books/2_Software_Engineering/DevOps/Tu_code_den_cloud.pdf",
+    "cover": "assets/covers/Tu_code_den_cloud.webp",
+    "format": "pdf",
+    "description": "Nhiều lập trình viên có thể viết mã nguồn chạy mượt mà trên máy cá nhân nhưng lại gặp lúng túng khi phải đưa ứng dụng lên môi trường sản phẩm thực tế với yêu cầu cao về khả năng mở rộng, tính sẵn sàng và tự động hóa. Khoảng cách giữa việc phát triển tính năng ở môi trường cục bộ và việc vận hành một hệ thống phân tán hiện đại trên nền tảng đám mây đòi hỏi tư duy toàn diện về kiến trúc hệ thống, đóng gói ứng dụng và quy trình triển khai liên tục.\n\nTừ Code đến Cloud: Microservices, K8s và DevOps trên AWS là cuốn cẩm nang kỹ thuật thực chiến dành cho cộng đồng kỹ sư phần mềm Việt Nam, dẫn dắt người đọc qua toàn bộ hành trình đưa sản phẩm từ những dòng mã đầu tiên lên hạ tầng điện toán đám mây. Tài liệu tiếp cận theo lộ trình từng bước rõ ràng, kết hợp giữa lý thuyết nền tảng và thực hành triển khai thực tế từ việc chuyển đổi kiến trúc nguyên khối sang Microservices, đóng gói bằng Docker, điều phối với Kubernetes cho đến tự động hóa quy trình CI/CD trên Amazon Web Services.\n\n• Nắm vững lộ trình chuyển đổi kiến trúc từ ứng dụng nguyên khối sang hệ thống Microservices linh hoạt và dễ mở rộng.\n• Xây dựng quy trình đóng gói ứng dụng tiêu chuẩn với Docker và quản lý, điều phối container quy mô lớn bằng Kubernetes.\n• Triển khai hệ thống tích hợp và phân phối liên tục nhằm tự động hóa toàn bộ chu trình kiểm thử và phát hành phần mềm.\n• Khám phá cách thiết kế, cấu hình và vận hành hạ tầng đám mây thực tế một cách tối ưu và bảo mật trên nền tảng AWS.\n• Tìm hiểu các phương pháp giám sát, xử lý sự cố và tối ưu hiệu năng cho hệ thống phân tán trong môi trường sản phẩm.",
+    "download_url": "https://github.com/Patruxs/bookshelves/releases/download/storage-v1/Tu_code_den_cloud.pdf"
+  },
+  {
+    "id": "dc52016f01ab",
+    "title": "Laws_of_Software_Engineering",
+    "category": "Software Engineering",
+    "topic": "Software Architecture and Design",
+    "file_path": "Books/2_Software_Engineering/Software_Architecture_and_Design/Laws_of_Software_Engineering.pdf",
+    "cover": "assets/covers/Laws_of_Software_Engineering.webp",
+    "format": "pdf",
+    "description": "Modern software teams frequently struggle with unpredictable complexity, shifting requirements, organizational bottlenecks, and recurring architectural failures that seem to defy purely technical solutions. Without a solid understanding of the timeless principles governing how software systems and engineering organizations actually behave, developers and leaders risk repeating the same costly mistakes across every project lifecycle.\n\nIn Laws of Software Engineering, Dr. Milan Milanović distills decades of industry wisdom into a comprehensive guide to the fundamental laws, principles, and mental models that shape software development. Drawing from classic computer science observations—such as Conway's Law, Brooks's Law, Goodhart's Law, and Hyrum's Law—alongside practical engineering leadership experience, the book bridges the gap between theoretical maxims and real-world decision-making in system design, team topology, and project delivery.\n\n• Master foundational software engineering laws, heuristics, and mental models that govern complex socio-technical systems.\n• Explore how organizational structure, communication pathways, and incentives directly shape software architecture and delivery outcomes.\n• Learn to anticipate project estimation pitfalls, technical debt accumulation, and scaling bottlenecks before they derail execution.\n• Implement pragmatic architectural and management trade-offs grounded in proven industry experience rather than hype.\n• Build resilient engineering teams and sustainable software systems that adapt gracefully to continuous change.",
+    "download_url": "https://github.com/Patruxs/bookshelves/releases/download/storage-v1/Laws_of_Software_Engineering.pdf"
   }
 ]

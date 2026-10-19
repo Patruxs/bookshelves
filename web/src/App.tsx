@@ -15,7 +15,7 @@ import { NotFoundPage } from "./pages/NotFound";
 
 export function App() {
   const [storedMode, setStoredMode] = useStoredState<ColorMode | null>(STORAGE_KEYS.theme, null);
-  const mode: ColorMode = storedMode ?? "dark";
+  const mode: ColorMode = storedMode ?? "light";
   const toggleMode = useCallback(() => setStoredMode(mode === "dark" ? "light" : "dark"), [mode, setStoredMode]);
 
   return (

@@ -1,60 +1,55 @@
 import { Button } from "@astryxdesign/core/Button";
-import { Grid } from "@astryxdesign/core/Grid";
 import { Heading } from "@astryxdesign/core/Heading";
 import { Icon } from "@astryxdesign/core/Icon";
+import { Link } from "@astryxdesign/core/Link";
 import { Skeleton } from "@astryxdesign/core/Skeleton";
 import { Text } from "@astryxdesign/core/Text";
 import { Token } from "@astryxdesign/core/Token";
 import { VStack } from "@astryxdesign/core/VStack";
-import { Shuffle } from "lucide-react";
-import { useMemo } from "react";
+import { Download, Shuffle } from "lucide-react";
+import { useCallback, useMemo } from "react";
 import { useNavigate } from "react-router-dom";
-import { CategoryTile } from "../components/CategoryTile";
+import { AmbientBackdrop } from "../components/AmbientBackdrop";
+import { BookCover } from "../components/BookCover";
+import { GenreTile } from "../components/GenreTile";
 import { LoadErrorState } from "../components/LoadingState";
 import { PageFrame } from "../components/PageFrame";
-import { PickCard } from "../components/PickCard";
-import { RecentList } from "../components/RecentList";
 import { Shelf } from "../components/Shelf";
-import { firstBookPerCategory, greetingForHour, pickDailyBook, sampleCovers, topTopics } from "../lib/data";
+import { pickDailyBook, sampleCovers, topTopics } from "../lib/data";
 import { useDocumentTitle, useIsPhone } from "../lib/hooks";
 import { useLibrary } from "../lib/library";
 import { bookPath, browsePath } from "../lib/routes";
+import { excerpt, formatLabel, topicLeaf } from "../lib/text";
 import type { Book } from "../lib/types";
 
-const PHONE_RECENT_LIMIT = 3;
+const SHELF_LIMIT = 12;
+const TOPIC_LIMIT = 12;
 
 export function HomePage() {
   useDocumentTitle("");
   const navigate = useNavigate();
   const isPhone = useIsPhone();
-  const { status, books, categories, recentIds, findBook } = useLibrary();
+  const { status, books, categories } = useLibrary();
   const daily = useMemo(() => pickDailyBook(books), [books]);
-  const recent = useMemo(
-    () =>
-      recentIds
-        .map(id => findBook(id))
-        .filter((book): book is Book => Boolean(book))
-        .slice(0, 4),
-    [recentIds, findBook]
-  );
-  const starters = useMemo(() => firstBookPerCategory(books, categories, 4), [books, categories]);
-  const topics = useMemo(() => topTopics(books, 12), [books]);
+  const topics = useMemo(() => topTopics(books, TOPIC_LIMIT), [books]);
   const shelves = useMemo(
     () =>
       categories.map(category => {
         const categoryBooks = books.filter(book => book.category === category.name);
         return {
           category,
-          books: categoryBooks.slice(0, 12),
+          books: categoryBooks.slice(0, SHELF_LIMIT),
           covers: sampleCovers(books, category.name, 3),
-          topicCount: new Set(categoryBooks.map(book => book.topic)).size,
-          topicLine: topTopics(categoryBooks, 4)
-            .map(topic => topic.leaf)
-            .join(" · ")
+          topicCount: new Set(categoryBooks.map(book => book.topic)).size
         };
       }),
     [books, categories]
   );
+
+  const surprise = useCallback(() => {
+    const book = books[Math.floor(Math.random() * books.length)];
+    if (book) navigate(bookPath(book.id));
+  }, [books, navigate]);
 
   if (status === "error") {
     return (
@@ -65,202 +60,159 @@ export function HomePage() {
   }
 
   if (status === "loading" || !daily) {
-    return (
-      <PageFrame>
-        <HomeSkeleton isPhone={isPhone} />
-      </PageFrame>
-    );
-  }
-
-  const surprise = () => {
-    const book = books[Math.floor(Math.random() * books.length)];
-    if (book) navigate(bookPath(book.id));
-  };
-
-  const greeting = (
-    <VStack gap={2} className="home-greeting">
-      <Heading level={1} type={isPhone ? undefined : "display-2"}>
-        {greetingForHour(new Date().getHours())}
-      </Heading>
-      <Text type={isPhone ? "body" : "large"} color="secondary">
-        {books.length} books on {categories.length} shelves. Pick one.
-      </Text>
-    </VStack>
-  );
-
-  const topicStrip = (
-    <VStack gap={3} className="topic-strip">
-      <Heading level={3}>Browse by topic</Heading>
-      <nav className="chip-row" aria-label="Topics">
-        {topics.map(topic => (
-          <Token
-            key={`${topic.category}::${topic.topic}`}
-            label={topic.leaf}
-            size={isPhone ? "sm" : "md"}
-            href={browsePath({ category: topic.category, topic: topic.topic })}
-            endContent={
-              <Text type="supporting" hasTabularNumbers>
-                {topic.count}
-              </Text>
-            }
-          />
-        ))}
-        <Button label="All topics" variant="ghost" size="sm" href="/browse" />
-      </nav>
-    </VStack>
-  );
-
-  const shelfList = shelves.map(shelf => (
-    <Shelf
-      key={shelf.category.name}
-      title={shelf.category.name}
-      description={isPhone ? undefined : shelf.topicLine}
-      count={shelf.category.count}
-      books={shelf.books}
-      href={browsePath({ category: shelf.category.name })}
-      variant={isPhone ? "compact" : "default"}
-    />
-  ));
-
-  const footer = (
-    <VStack gap={3} hAlign="center" className="home-footer">
-      <Text type="supporting">Don't know what to read?</Text>
-      <Button
-        label="Surprise me"
-        variant="secondary"
-        icon={<Icon icon={Shuffle} />}
-        onClick={surprise}
-        width={isPhone ? "100%" : undefined}
-      />
-    </VStack>
-  );
-
-  const recentTitle = recent.length ? "Jump back in" : "Start here";
-  const recentBooks = recent.length ? recent : starters;
-
-  if (isPhone) {
-    return (
-      <PageFrame>
-        <VStack gap={8}>
-          {greeting}
-          <PickCard book={daily} />
-          {topicStrip}
-          <RecentList variant="plain" title={recentTitle} books={recentBooks.slice(0, PHONE_RECENT_LIMIT)} />
-          {shelfList}
-          {footer}
-        </VStack>
-      </PageFrame>
-    );
+    return <HomeSkeleton />;
   }
 
   return (
-    <PageFrame>
-      <VStack gap={10}>
-        {greeting}
+    <>
+      <Hero book={daily} onSurprise={surprise} isPhone={isPhone} />
+      <PageFrame width="default">
+        <VStack gap={10}>
+          <VStack gap={4}>
+            <div className="section-head">
+              <Heading level={2}>Shelves</Heading>
+            </div>
+            <div className="genre-grid" style={{ "--genre-count": Math.min(shelves.length, 6) } as React.CSSProperties}>
+              {shelves.map((shelf, index) => (
+                <GenreTile
+                  key={shelf.category.name}
+                  name={shelf.category.name}
+                  count={shelf.category.count}
+                  topicCount={shelf.topicCount}
+                  covers={shelf.covers}
+                  index={index}
+                />
+              ))}
+            </div>
+          </VStack>
 
-        <div className="home-hero">
-          <PickCard book={daily} />
-          <RecentList title={recentTitle} books={recentBooks} />
-        </div>
+          <VStack gap={3}>
+            <div className="section-head">
+              <Heading level={3} accessibilityLevel={2}>
+                Browse by topic
+              </Heading>
+            </div>
+            <nav className="chip-row" aria-label="Topics">
+              {topics.map(topic => (
+                <Token
+                  key={`${topic.category}::${topic.topic}`}
+                  label={topic.leaf}
+                  size="md"
+                  href={browsePath({ category: topic.category, topic: topic.topic })}
+                  endContent={
+                    <Text type="supporting" hasTabularNumbers>
+                      {topic.count}
+                    </Text>
+                  }
+                />
+              ))}
+              <Button label="All topics" variant="ghost" size="sm" href="/browse" />
+            </nav>
+          </VStack>
 
-        <VStack gap={4} className="category-tiles">
-          <Heading level={2}>Your shelves</Heading>
-          <Grid columns={{ minWidth: 200 }} gap={4}>
-            {shelves.map(shelf => (
-              <CategoryTile
-                key={shelf.category.name}
-                name={shelf.category.name}
-                count={shelf.category.count}
-                topicCount={shelf.topicCount}
-                covers={shelf.covers}
-              />
-            ))}
-          </Grid>
+          {shelves.map(shelf => (
+            <Shelf
+              key={shelf.category.name}
+              title={shelf.category.name}
+              count={shelf.category.count}
+              books={shelf.books}
+              href={browsePath({ category: shelf.category.name })}
+            />
+          ))}
+
+          <VStack gap={3} hAlign="center" className="home-footer">
+            <Text type="supporting">Don't know what to read?</Text>
+            <Button label="Surprise me" variant="secondary" icon={<Icon icon={Shuffle} />} onClick={surprise} width={isPhone ? "100%" : undefined} />
+          </VStack>
         </VStack>
-
-        {topicStrip}
-
-        {shelfList}
-
-        {footer}
-      </VStack>
-    </PageFrame>
+      </PageFrame>
+    </>
   );
 }
 
-function HomeSkeleton({ isPhone }: { isPhone: boolean }) {
-  if (isPhone) {
-    return (
-      <VStack gap={8}>
-        <VStack gap={3}>
-          <Skeleton height={32} width={220} />
-          <Skeleton height={18} width={260} index={1} />
-        </VStack>
-        <Skeleton height={176} width="100%" index={2} />
-        <VStack gap={3}>
-          <Skeleton height={24} width={160} index={3} />
-          <Skeleton height={24} width="100%" index={4} />
-        </VStack>
-        <div className="shelf-skeleton">
-          {Array.from({ length: 4 }, (_, index) => (
-            <div key={index} className="shelf-item">
-              <div className="book-cover">
-                <Skeleton index={index + 5} radius={2} />
-              </div>
-            </div>
-          ))}
-        </div>
-      </VStack>
-    );
-  }
+function Hero({ book, onSurprise, isPhone }: { book: Book; onSurprise: () => void; isPhone: boolean }) {
+  const primaryFormat = book.formats[0];
+  const primaryUrl = book.downloads[primaryFormat] || "";
   return (
-    <VStack gap={10}>
-      <VStack gap={3}>
-        <Skeleton height={36} width={280} />
-        <Skeleton height={18} width={320} index={1} />
-      </VStack>
-      <div className="home-hero">
-        <div className="pick-card">
-          <div className="pick-grid">
-            <div className="pick-cover">
+    <section className="hero-bleed" aria-label="Today's pick">
+      <AmbientBackdrop book={book} />
+      <div className="hero-bleed-inner">
+        <div className="hero-grid">
+          <VStack gap={isPhone ? 3 : 4} className="hero-body">
+            <span className="eyebrow">
+              <span className="eyebrow-accent">Today's pick</span>
+              <span aria-hidden="true">·</span>
+              <Link href={browsePath({ category: book.category })} color="inherit">
+                {book.category}
+              </Link>
+              <span aria-hidden="true">/</span>
+              <Link href={browsePath({ category: book.category, topic: book.topic })} color="inherit">
+                {topicLeaf(book.topic)}
+              </Link>
+            </span>
+            <Heading level={1} type={isPhone ? "display-3" : "display-1"} textWrap="balance" maxLines={3} hasTruncateTooltip={false}>
+              {book.title}
+            </Heading>
+            {book.description ? (
+              <Text type={isPhone ? "body" : "large"} color="secondary" maxLines={3} hasTruncateTooltip={false} as="p">
+                {excerpt(book.description, 320)}
+              </Text>
+            ) : null}
+            <div className="hero-actions">
+              <Button
+                label={`Download ${formatLabel(primaryFormat)}`}
+                variant="primary"
+                icon={<Icon icon={Download} />}
+                href={primaryUrl || undefined}
+                isDisabled={!primaryUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+              />
+              <Button label="Open" variant="secondary" href={bookPath(book.id)} />
+              <Button label="Surprise me" variant="ghost" icon={<Icon icon={Shuffle} />} onClick={onSurprise} />
+            </div>
+          </VStack>
+          <Link href={bookPath(book.id)} label={`Open ${book.title}`} className="cover-tilt">
+            <BookCover book={book} priority />
+          </Link>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function HomeSkeleton() {
+  return (
+    <>
+      <section className="hero-bleed" aria-hidden="true">
+        <div className="hero-bleed-inner">
+          <div className="hero-grid">
+            <VStack gap={4} className="hero-body">
+              <Skeleton height={12} width={200} />
+              <Skeleton height={56} width="90%" index={1} />
+              <Skeleton height={20} width="80%" index={2} />
+              <Skeleton height={40} width={320} index={3} />
+            </VStack>
+            <div className="cover-tilt">
               <div className="book-cover">
                 <Skeleton radius={2} />
               </div>
             </div>
-            <VStack gap={3} className="pick-body">
-              <Skeleton height={12} width={96} index={1} />
-              <Skeleton height={32} width="85%" index={2} />
-              <Skeleton height={40} width="95%" index={3} />
-              <Skeleton height={36} width={220} index={4} />
-            </VStack>
           </div>
         </div>
-        <div className="recent-card-skeleton">
-          <VStack gap={3}>
-            <Skeleton height={24} width={160} />
-            {Array.from({ length: 4 }, (_, index) => (
-              <Skeleton key={index} height={56} width="100%" index={index + 1} />
-            ))}
-          </VStack>
-        </div>
-      </div>
-      <Grid columns={{ minWidth: 200 }} gap={4}>
-        {Array.from({ length: 4 }, (_, index) => (
-          <Skeleton key={index} height={112} width="100%" index={index} />
-        ))}
-      </Grid>
-      <VStack gap={3}>
-        <Skeleton height={24} width={240} />
-        <div className="shelf-skeleton">
-          {Array.from({ length: 8 }, (_, index) => (
-            <div key={index} className="shelf-item">
-              <div className="book-cover">
-                <Skeleton index={index} radius={2} />
-              </div>
+      </section>
+      <PageFrame>
+        <VStack gap={10} aria-hidden="true">
+          <VStack gap={4}>
+            <Skeleton height={28} width={120} />
+            <div className="genre-grid">
+              {Array.from({ length: 5 }, (_, index) => (
+                <Skeleton key={index} height={110} width="100%" index={index} />
+              ))}
             </div>
-          ))}
-        </div>
-      </VStack>
-    </VStack>
+          </VStack>
+        </VStack>
+      </PageFrame>
+    </>
   );
 }

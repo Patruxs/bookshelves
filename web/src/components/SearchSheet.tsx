@@ -56,7 +56,7 @@ export function SearchSheet({ isOpen, onOpenChange }: SearchSheetProps) {
               isLabelHidden
               size="md"
               startIcon={Search}
-              placeholder="Search titles, topics, descriptions"
+              placeholder="Search books, topics, shelves"
               value={query}
               onChange={setQuery}
               hasClear

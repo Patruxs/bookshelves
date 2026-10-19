@@ -1,0 +1,89 @@
+.book-detail-text {
+  min-width: 0;
+}
+
+.book-back {
+  margin-inline-start: calc(-1 * var(--spacing-2));
+  margin-bottom: var(--spacing-2);
+}
+
+.book-detail-text .eyebrow {
+  color: var(--color-text-secondary);
+  text-decoration: none;
+}
+
+.book-detail-text .eyebrow:hover {
+  color: var(--color-text-primary);
+}
+
+.book-title {
+  overflow-wrap: anywhere;
+}
+
+.book-detail-cover {
+  width: 280px;
+}
+
+.book-detail-cover .book-cover-lg {
+  width: 100%;
+}
+
+.hero-bleed.book-detail-hero + .page-frame {
+  padding-top: var(--spacing-4);
+}
+
+.book-detail-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 380px;
+  gap: var(--spacing-10);
+  align-items: start;
+}
+
+.book-detail-side {
+  min-width: 0;
+}
+
+.book-file-name {
+  overflow-wrap: anywhere;
+}
+
+.book-action-bar .book-action-primary {
+  width: 100%;
+}
+
+.detail-description {
+  max-width: 68ch;
+}
+
+.detail-list {
+  display: grid;
+  gap: var(--spacing-1);
+  margin: 0;
+  padding-inline-start: var(--spacing-5);
+}
+
+.detail-list li {
+  display: list-item;
+  list-style: disc;
+}
+
+.detail-list li > * {
+  display: inline;
+}
+
+.detail-list li::marker {
+  color: var(--color-accent);
+}
+
+.description-clamp {
+  white-space: pre-line;
+}
+
+@media (max-width: 1023px) {
+  .book-detail-hero .hero-grid > .book-detail-cover {
+    width: 200px;
+  }
+  .book-detail-body {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

@@ -1,5 +1,5 @@
-import { Badge } from "@astryxdesign/core/Badge";
 import { Button } from "@astryxdesign/core/Button";
+import { Card } from "@astryxdesign/core/Card";
 import { DropdownMenu } from "@astryxdesign/core/DropdownMenu";
 import { EmptyState } from "@astryxdesign/core/EmptyState";
 import { Heading } from "@astryxdesign/core/Heading";
@@ -7,27 +7,28 @@ import { HStack } from "@astryxdesign/core/HStack";
 import { Icon } from "@astryxdesign/core/Icon";
 import { IconButton } from "@astryxdesign/core/IconButton";
 import { Link } from "@astryxdesign/core/Link";
+import { MetadataList, MetadataListItem } from "@astryxdesign/core/MetadataList";
 import { Skeleton } from "@astryxdesign/core/Skeleton";
 import { StackItem } from "@astryxdesign/core/Stack";
 import { Text } from "@astryxdesign/core/Text";
 import { useToast } from "@astryxdesign/core/Toast";
+import { Token } from "@astryxdesign/core/Token";
 import { VStack } from "@astryxdesign/core/VStack";
 import { ArrowLeft, Download, Eye, Share2 } from "lucide-react";
-import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useParams } from "react-router-dom";
 import { AmbientBackdrop } from "../components/AmbientBackdrop";
 import { BookCover } from "../components/BookCover";
 import { LoadErrorState } from "../components/LoadingState";
 import { PageFrame } from "../components/PageFrame";
-import { RecentList } from "../components/RecentList";
-import { Shelf } from "../components/Shelf";
+import { RankList } from "../components/RankList";
 import { sameCategoryBooks, sameTopicBooks } from "../lib/data";
 import { useDocumentTitle, useIsDesktop } from "../lib/hooks";
 import { useLibrary } from "../lib/library";
 import { browsePath, viewerUrl } from "../lib/routes";
 import { formatLabel, topicLeaf } from "../lib/text";
 import type { Book } from "../lib/types";
-
+import "./book.css";
 export function BookDetailPage() {
   const { id = "" } = useParams();
   const { status, books, findBook, markViewed } = useLibrary();
@@ -52,43 +53,42 @@ export function BookDetailPage() {
 
   if (status === "loading") {
     return (
-      <PageFrame>
-        <VStack gap={8} aria-hidden="true">
-          <Skeleton height={28} width={160} />
-          <section className="book-hero">
-            <div className="book-hero-grid">
-              <div className="book-hero-cover">
+      <div aria-hidden="true">
+        <section className="hero-bleed book-detail-hero">
+          <div className="hero-bleed-inner">
+            <div className="hero-grid">
+              <VStack gap={3} className="hero-body book-detail-text">
+                <Skeleton height={28} width={160} />
+                <Skeleton height={12} width={120} index={1} />
+                <Skeleton height={24} width={240} index={2} />
+                <Skeleton height={56} width="85%" index={3} />
+                <Skeleton height={14} width={100} index={4} />
+                <Skeleton height={40} width={320} index={5} />
+              </VStack>
+              <div className="book-detail-cover">
                 <div className="book-cover">
                   <Skeleton radius={2} />
                 </div>
               </div>
-              <VStack gap={3} className="book-hero-body">
-                <Skeleton height={12} width={120} index={1} />
-                <Skeleton height={14} width={240} index={2} />
-                <Skeleton height={48} width="80%" index={3} />
-                <Skeleton height={14} width={100} index={4} />
-                <Skeleton height={32} width={320} index={5} />
-              </VStack>
             </div>
-          </section>
-          <div className="book-body">
-            <VStack gap={4} className="book-body-main">
-              <Skeleton height={24} width={120} index={6} />
+          </div>
+        </section>
+        <PageFrame>
+          <div className="book-detail-body">
+            <VStack gap={4}>
+              <Skeleton height={28} width={120} index={6} />
               <Skeleton height={14} width="95%" index={7} />
               <Skeleton height={14} width="90%" index={8} />
               <Skeleton height={14} width="70%" index={9} />
             </VStack>
-            <div className="book-body-side recent-card-skeleton">
-              <VStack gap={3}>
-                <Skeleton height={24} width={160} index={10} />
-                <Skeleton height={56} index={11} />
-                <Skeleton height={56} index={12} />
-                <Skeleton height={56} index={13} />
-              </VStack>
-            </div>
+            <VStack gap={3}>
+              <Skeleton height={180} index={10} />
+              <Skeleton height={56} index={11} />
+              <Skeleton height={56} index={12} />
+            </VStack>
           </div>
-        </VStack>
-      </PageFrame>
+        </PageFrame>
+      </div>
     );
   }
 
@@ -118,9 +118,9 @@ function BookDetail({ book, books }: BookDetailProps) {
   const sameTopic = useMemo(() => sameTopicBooks(book, books).slice(0, 5), [book, books]);
   const sameCategory = useMemo(() => sameCategoryBooks(book, books).slice(0, 5), [book, books]);
   const related = sameTopic.length
-    ? { title: `More in ${topicLeaf(book.topic)}`, books: sameTopic, href: browsePath({ category: book.category, topic: book.topic }), label: `View all in ${topicLeaf(book.topic)}` }
+    ? { title: `More in ${topicLeaf(book.topic)}`, books: sameTopic, href: browsePath({ category: book.category, topic: book.topic }) }
     : sameCategory.length
-      ? { title: `More in ${book.category}`, books: sameCategory, href: browsePath({ category: book.category }), label: `View all in ${book.category}` }
+      ? { title: `More in ${book.category}`, books: sameCategory, href: browsePath({ category: book.category }) }
       : null;
   const topicHref = (path: string) => browsePath({ category: book.category, topic: path });
   const topicCrumbs = book.topicParts.map((part, index) => ({
@@ -142,55 +142,107 @@ function BookDetail({ book, books }: BookDetailProps) {
     }
   };
 
+  const hero = (
+    <section className="hero-bleed book-detail-hero" aria-label={book.title}>
+      <AmbientBackdrop book={book} />
+      <div className="hero-bleed-inner">
+        <div className="hero-grid">
+          <VStack gap={3} hAlign={isDesktop ? "start" : "center"} className="hero-body book-detail-text">
+            {isDesktop ? (
+              <Button
+                label={`Back to ${topicLeaf(book.topic)}`}
+                variant="ghost"
+                size="sm"
+                icon={<Icon icon={ArrowLeft} />}
+                href={browsePath({ category: book.category, topic: book.topic })}
+                className="book-back"
+              />
+            ) : null}
+            <Link href={browsePath({ category: book.category })} color="inherit" className="eyebrow">
+              {book.category}
+            </Link>
+            <HStack gap={1.5} vAlign="center" hAlign={isDesktop ? "start" : "center"} wrap="wrap" aria-label="Topic path">
+              {topicCrumbs.map(crumb => (
+                <Token key={crumb.path} label={crumb.label} size="sm" href={topicHref(crumb.path)} />
+              ))}
+            </HStack>
+            <Heading level={1} type="display-1" textWrap="balance" className="book-title">
+              {book.title}
+            </Heading>
+            <Text type="supporting">{book.formats.map(formatLabel).join(" · ")}</Text>
+            {isDesktop ? (
+              <div className="hero-actions">
+                <DownloadAction book={book} />
+                <ReadOnlineButton book={book} />
+                <Button label="Share" variant="ghost" icon={<Icon icon={Share2} />} onClick={share} />
+              </div>
+            ) : null}
+          </VStack>
+          <div className="cover-tilt book-detail-cover">
+            <BookCover book={book} size="lg" priority />
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+
+  const details = (
+    <Card className="book-details">
+      <VStack gap={3}>
+        <Heading level={2}>Details</Heading>
+        <MetadataList>
+          <MetadataListItem label="Category">
+            <Link href={browsePath({ category: book.category })} color="primary">
+              {book.category}
+            </Link>
+          </MetadataListItem>
+          <MetadataListItem label="Topic">
+            <Link href={topicHref(book.topic)} color="primary">
+              {book.topicParts.join(" / ")}
+            </Link>
+          </MetadataListItem>
+          <MetadataListItem label="Formats">{book.formats.map(formatLabel).join(", ")}</MetadataListItem>
+          <MetadataListItem label="File name">
+            <span className="book-file-name">{book.rawTitle}</span>
+          </MetadataListItem>
+        </MetadataList>
+      </VStack>
+    </Card>
+  );
+
+  const relatedList = related ? (
+    <VStack gap={3}>
+      <div className="section-head">
+        <Heading level={2}>{related.title}</Heading>
+        <span className="section-head-fill" />
+        <Link href={related.href} isStandalone size="sm">
+          See all
+        </Link>
+      </div>
+      <RankList books={related.books} variant="vertical" label={related.title} />
+    </VStack>
+  ) : null;
+
   if (!isDesktop) {
     return (
-      <PageFrame>
-        <VStack gap={8} className="book-page-mobile">
-          <section className="book-hero-mobile ambient-host" aria-label={book.title}>
-            <AmbientBackdrop book={book} />
-            <VStack gap={3} hAlign="center" className="book-hero-mobile-body">
-              <div className="book-hero-mobile-cover">
-                <BookCover book={book} size="lg" priority />
-              </div>
-              <Text type="supporting" textWrap="balance">
-                {[{ label: book.category, href: browsePath({ category: book.category }) }, ...topicCrumbs.map(crumb => ({ label: crumb.label, href: topicHref(crumb.path) }))].map(
-                  (crumb, index, crumbs) => (
-                    <Fragment key={crumb.href}>
-                      <span className="crumb-segment">
-                        <Link href={crumb.href} color="secondary">
-                          {crumb.label}
-                        </Link>
-                        {index < crumbs.length - 1 ? " /" : null}
-                      </span>
-                      {index < crumbs.length - 1 ? " " : null}
-                    </Fragment>
-                  )
-                )}
-              </Text>
-              <Heading level={1} textWrap="balance">
-                {book.title}
-              </Heading>
-              <HStack gap={1} hAlign="center" wrap="wrap">
-                {book.formats.map(format => (
-                  <Badge key={format} label={formatLabel(format)} />
-                ))}
-              </HStack>
+      <>
+        {hero}
+        <PageFrame>
+          <VStack gap={8} className="book-detail-mobile">
+            <VStack gap={4}>
+              <Heading level={2}>About</Heading>
+              {book.description ? (
+                <ClampedDescription text={book.description} />
+              ) : (
+                <Text type="body" color="secondary">
+                  No description yet.
+                </Text>
+              )}
             </VStack>
-          </section>
-
-          <VStack gap={4}>
-            <Heading level={2}>About</Heading>
-            {book.description ? (
-              <ClampedDescription text={book.description} />
-            ) : (
-              <Text type="body" color="secondary">
-                No description yet.
-              </Text>
-            )}
+            {details}
+            {relatedList}
           </VStack>
-
-          {related ? <Shelf title={related.title} books={related.books} href={related.href} linkLabel="View all" headingLevel={2} /> : null}
-        </VStack>
+        </PageFrame>
 
         <div className="book-action-bar" role="group" aria-label="Book actions">
           <HStack gap={2} vAlign="center">
@@ -211,58 +263,16 @@ function BookDetail({ book, books }: BookDetailProps) {
             <IconButton label="Share" tooltip="Share" variant="secondary" icon={<Icon icon={Share2} />} onClick={share} />
           </HStack>
         </div>
-      </PageFrame>
+      </>
     );
   }
 
   return (
-    <PageFrame>
-      <VStack gap={8}>
-        <div>
-          <Button
-            label={`Back to ${topicLeaf(book.topic)}`}
-            variant="ghost"
-            size="sm"
-            icon={<Icon icon={ArrowLeft} />}
-            href={browsePath({ category: book.category, topic: book.topic })}
-          />
-        </div>
-
-        <section className="book-hero ambient-host" aria-label={book.title}>
-          <AmbientBackdrop book={book} />
-          <div className="book-hero-grid">
-            <div className="book-hero-cover">
-              <BookCover book={book} size="lg" priority />
-            </div>
-            <VStack gap={3} className="book-hero-body">
-              <span className="pick-eyebrow">
-                <Text type="supporting">{book.category}</Text>
-              </span>
-              <HStack gap={2} vAlign="center" wrap="wrap" className="pick-path">
-                {topicCrumbs.map((crumb, index) => (
-                  <Fragment key={crumb.path}>
-                    {index > 0 ? <Text type="supporting">/</Text> : null}
-                    <Link href={topicHref(crumb.path)} color="secondary" isStandalone size="sm">
-                      {crumb.label}
-                    </Link>
-                  </Fragment>
-                ))}
-              </HStack>
-              <Heading level={1} type="display-2" textWrap="balance">
-                {book.title}
-              </Heading>
-              <Text type="supporting">{book.formats.map(formatLabel).join(" · ")}</Text>
-              <div className="book-actions">
-                <DownloadAction book={book} />
-                <ReadOnlineButton book={book} />
-                <IconButton className="book-share" label="Share" tooltip="Share" variant="ghost" icon={<Icon icon={Share2} />} onClick={share} />
-              </div>
-            </VStack>
-          </div>
-        </section>
-
-        <div className="book-body">
-          <VStack gap={4} className="book-body-main">
+    <>
+      {hero}
+      <PageFrame>
+        <div className="book-detail-body">
+          <VStack gap={4} className="book-detail-main">
             <Heading level={2}>About</Heading>
             {book.description ? (
               <Description text={book.description} />
@@ -272,19 +282,15 @@ function BookDetail({ book, books }: BookDetailProps) {
               </Text>
             )}
           </VStack>
-          <aside className="book-body-side">
-            {related ? (
-              <VStack gap={3}>
-                <RecentList title={related.title} books={related.books} />
-                <Link href={related.href} isStandalone size="sm">
-                  {related.label}
-                </Link>
-              </VStack>
-            ) : null}
+          <aside className="book-detail-side">
+            <VStack gap={8}>
+              {details}
+              {relatedList}
+            </VStack>
           </aside>
         </div>
-      </VStack>
-    </PageFrame>
+      </PageFrame>
+    </>
   );
 }
 

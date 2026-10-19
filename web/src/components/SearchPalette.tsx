@@ -31,9 +31,9 @@ export function SearchPalette({ isOpen, onOpenChange }: SearchPaletteProps) {
       label="Search the library"
       value=""
       onValueChange={onValueChange}
-      input={<CommandPaletteInput placeholder="Search titles, topics, descriptions" label="Search the library" />}
+      input={<CommandPaletteInput placeholder="Search books, topics, shelves" label="Search the library" />}
       emptyBootstrapText="Type to search the library"
-      emptySearchText="No books match"
+      emptySearchText="No matches. Try fewer words or check the spelling."
       renderItem={item => <SearchResultRow item={item} />}
     />
   );

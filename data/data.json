@@ -1639,17 +1639,6 @@
     "download_url": "https://github.com/Patruxs/bookshelves/releases/download/storage-v1/The_Minto_Pyramid_Principle_Logic_In_Writing_Thinking.pdf"
   },
   {
-    "id": "172fbe02d2fe",
-    "title": "Claude_AI_cho_CEO_Thuc_hanh_SP",
-    "category": "Personal Development and Skills",
-    "topic": "AI and Prompts",
-    "file_path": "Books/4_Personal_Development_and_Skills/AI_and_Prompts/Claude_AI_cho_CEO_Thuc_hanh_SP.pdf",
-    "cover": "assets/covers/Claude_AI_cho_CEO_Thuc_hanh_SP.webp",
-    "format": "pdf",
-    "description": "Trong kỷ nguyên AI, các CEO và lãnh đạo doanh nghiệp đối mặt với thách thức lớn: làm sao tận dụng AI để tăng tốc phát triển sản phẩm mà không cần nền tảng kỹ thuật sâu. Claude AI của Anthropic nổi lên như công cụ mạnh mẽ cho việc ra quyết định chiến lược và quản lý sản phẩm.\n\nCuốn sách \"Claude AI cho CEO — Thực hành SP\" hướng dẫn thực hành cụ thể cách các nhà lãnh đạo sử dụng Claude AI trong quy trình phát triển sản phẩm (Product Development). Nội dung tập trung vào các kịch bản thực tế mà CEO/CPO/PM gặp hàng ngày, từ phân tích thị trường đến lên kế hoạch sản phẩm.\n\n• Ứng dụng Claude AI vào phân tích thị trường và nghiên cứu đối thủ cạnh tranh\n• Xây dựng product roadmap và ưu tiên tính năng với sự hỗ trợ của AI\n• Viết PRD (Product Requirements Document) và user stories hiệu quả bằng Claude\n• Tối ưu quy trình ra quyết định chiến lược dựa trên dữ liệu và AI insights\n• Tích hợp Claude vào workflow hàng ngày của đội ngũ lãnh đạo và quản lý sản phẩm",
-    "download_url": "https://github.com/Patruxs/bookshelves/releases/download/storage-v1/Claude_AI_cho_CEO_Thuc_hanh_SP.pdf"
-  },
-  {
     "id": "5644a13012dd",
     "title": "How_Anthropic_teams_use_Claude_Code_v2",
     "category": "Personal Development and Skills",
